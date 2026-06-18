@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+chembl_raw_cache.pkl
+EOBZIP_2026_04/
+*.bak
+*.log

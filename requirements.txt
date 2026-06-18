@@ -1,0 +1,7 @@
+pandas>=2.0.0
+rdkit>=2023.9.1
+streamlit>=1.28.0
+chembl-webresource-client>=0.10.8
+plotly>=5.18.0
+requests>=2.31.0
+tqdm>=4.66.0

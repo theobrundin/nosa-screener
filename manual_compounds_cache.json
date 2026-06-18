@@ -1,0 +1,112 @@
+{
+  "linalool": {
+    "pubchem_cid": 6549,
+    "molecular_weight": 154.25,
+    "logP": 2.7,
+    "PSA": 20.2,
+    "H_donors": 1.0,
+    "H_acceptors": 1.0,
+    "rotatable_bonds": 4.0,
+    "SMILES": "CC(=CCCC(C)(C=C)O)C"
+  },
+  "limonene": {
+    "pubchem_cid": 22311,
+    "molecular_weight": 136.23,
+    "logP": 3.4,
+    "PSA": 0.0,
+    "H_donors": 0.0,
+    "H_acceptors": 0.0,
+    "rotatable_bonds": 1.0,
+    "SMILES": "CC1=CCC(CC1)C(=C)C"
+  },
+  "alpha-pinene": {
+    "pubchem_cid": 6654,
+    "molecular_weight": 136.23,
+    "logP": 2.8,
+    "PSA": 0.0,
+    "H_donors": 0.0,
+    "H_acceptors": 0.0,
+    "rotatable_bonds": 0.0,
+    "SMILES": "CC1=CCC2CC1C2(C)C"
+  },
+  "geraniol": {
+    "pubchem_cid": 637566,
+    "molecular_weight": 154.25,
+    "logP": 2.9,
+    "PSA": 20.2,
+    "H_donors": 1.0,
+    "H_acceptors": 1.0,
+    "rotatable_bonds": 4.0,
+    "SMILES": "CC(=CCCC(=CCO)C)C"
+  },
+  "vanillin": {
+    "pubchem_cid": 1183,
+    "molecular_weight": 152.15,
+    "logP": 1.2,
+    "PSA": 46.5,
+    "H_donors": 1.0,
+    "H_acceptors": 3.0,
+    "rotatable_bonds": 2.0,
+    "SMILES": "COC1=C(C=CC(=C1)C=O)O"
+  },
+  "eugenol": {
+    "pubchem_cid": 3314,
+    "molecular_weight": 164.2,
+    "logP": 2.0,
+    "PSA": 29.5,
+    "H_donors": 1.0,
+    "H_acceptors": 2.0,
+    "rotatable_bonds": 3.0,
+    "SMILES": "COC1=C(C=CC(=C1)CC=C)O"
+  },
+  "cinnamaldehyde": {
+    "pubchem_cid": 637511,
+    "molecular_weight": 132.16,
+    "logP": 1.9,
+    "PSA": 17.1,
+    "H_donors": 0.0,
+    "H_acceptors": 1.0,
+    "rotatable_bonds": 2.0,
+    "SMILES": "C1=CC=C(C=C1)C=CC=O"
+  },
+  "benzaldehyde": {
+    "pubchem_cid": 240,
+    "molecular_weight": 106.12,
+    "logP": 1.5,
+    "PSA": 17.1,
+    "H_donors": 0.0,
+    "H_acceptors": 1.0,
+    "rotatable_bonds": 1.0,
+    "SMILES": "C1=CC=C(C=C1)C=O"
+  },
+  "piperidine": {
+    "pubchem_cid": 8082,
+    "molecular_weight": 85.15,
+    "logP": 0.8,
+    "PSA": 12.0,
+    "H_donors": 1.0,
+    "H_acceptors": 1.0,
+    "rotatable_bonds": 0.0,
+    "SMILES": "C1CCNCC1"
+  },
+  "pyridine": {
+    "pubchem_cid": 1049,
+    "molecular_weight": 79.1,
+    "logP": 0.7,
+    "PSA": 12.9,
+    "H_donors": 0.0,
+    "H_acceptors": 1.0,
+    "rotatable_bonds": 0.0,
+    "SMILES": "C1=CC=NC=C1"
+  },
+  "indole": {
+    "pubchem_cid": 798,
+    "molecular_weight": 117.15,
+    "logP": 2.1,
+    "PSA": 15.8,
+    "H_donors": 1.0,
+    "H_acceptors": 0.0,
+    "rotatable_bonds": 0.0,
+    "SMILES": "C1=CC=C2C(=C1)C=CN2"
+  }
+}
