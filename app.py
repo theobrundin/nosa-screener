@@ -68,6 +68,8 @@ FILTER_STEPS = {
     "melting_point_c": 1.0,
 }
 
+ACCESS_PASSWORD = "cerevia"
+
 
 def database_path() -> Path:
     """Prefer enriched CSV when it exists and has at least as many rows as master."""
@@ -469,6 +471,23 @@ def benchmark_text(ideal: dict[str, float], n_criteria: int) -> str:
     return " · ".join(parts) + f" ({n_criteria} criteria)"
 
 
+def require_password() -> None:
+    """Block access until the correct password is entered. Resets on page reload."""
+    if st.session_state.get("authenticated"):
+        return
+
+    st.title("NOSA Drug Screener")
+    st.markdown("Enter the access password to continue.")
+    password = st.text_input("Password", type="password", key="access_password")
+    if st.button("Unlock"):
+        if password == ACCESS_PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="NOSA Drug Screener",
@@ -477,6 +496,7 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
     inject_styles()
+    require_password()
 
     path = database_path()
     df = load_database(str(path))
