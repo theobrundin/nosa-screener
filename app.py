@@ -19,6 +19,7 @@ ACCENT = "#00BFBF"
 TEXT = "#FFFFFF"
 SURFACE = "#174F4F"
 DISABLED = "#3A6B6B"
+MEMANTINE_COLOR = "#FFD700"
 
 BASE_IDEAL = {
     "molecular_weight": 179.31,
@@ -122,6 +123,24 @@ def inject_styles() -> None:
             border: none;
             font-weight: 600;
         }}
+        [data-testid="stSidebar"] .stButton > button {{
+            background-color: {ACCENT} !important;
+            color: {PRIMARY} !important;
+            border: none;
+            font-weight: 600;
+        }}
+        [data-testid="stNumberInput"] button {{
+            color: {ACCENT} !important;
+            border-color: {ACCENT} !important;
+        }}
+        [data-testid="stNumberInput"] input {{
+            color: {TEXT} !important;
+            background-color: {SURFACE} !important;
+            border-color: {ACCENT} !important;
+        }}
+        .stSlider [data-baseweb="slider"] div {{
+            color: {ACCENT} !important;
+        }}
         .nosa-note {{
             color: {ACCENT} !important;
             font-size: 0.85rem;
@@ -185,11 +204,16 @@ def composite_score(
 
 def apply_filters(df: pd.DataFrame, bounds: dict[str, tuple[float, float]]) -> pd.DataFrame:
     mask = pd.Series(True, index=df.index)
+    pubchem_cols = set(PUBCHEM_COLUMNS)
     for col, (lo, hi) in bounds.items():
         if col not in df.columns:
             continue
-        # Missing PubChem values pass filters; scored as 0 in composite
-        mask &= df[col].isna() | df[col].between(lo, hi)
+        in_range = df[col].between(lo, hi)
+        if col in pubchem_cols:
+            # Sparse PubChem data: missing values pass but score 0 in composite
+            mask &= df[col].isna() | in_range
+        else:
+            mask &= df[col].notna() & in_range
     return df.loc[mask].copy()
 
 
@@ -325,7 +349,7 @@ def build_scatter(df: pd.DataFrame, ideal: dict[str, float]) -> go.Figure:
             y=[ideal["logP"]],
             mode="markers+text",
             name="Memantine (ideal)",
-            marker=dict(color="#FFD700", size=16, symbol="diamond"),
+            marker=dict(color=MEMANTINE_COLOR, size=16, symbol="diamond"),
             text=["Memantine"],
             textposition="top center",
             textfont=dict(color=TEXT, size=11),
@@ -348,6 +372,15 @@ def build_scatter(df: pd.DataFrame, ideal: dict[str, float]) -> go.Figure:
     return fig
 
 
+def _init_filter_bounds(col: str, default: tuple[float, float]) -> None:
+    lo_key = f"filter_{col}_lo"
+    hi_key = f"filter_{col}_hi"
+    if lo_key not in st.session_state:
+        st.session_state[lo_key] = float(default[0])
+    if hi_key not in st.session_state:
+        st.session_state[hi_key] = float(default[1])
+
+
 def render_range_filter(
     col: str,
     label: str,
@@ -358,51 +391,76 @@ def render_range_filter(
     *,
     disabled: bool = False,
 ) -> tuple[float, float]:
-    """Range filter with keyboard-editable min/max inputs and a slider."""
+    """Range filter with keyboard min/max inputs and a synced slider."""
     lo_bound = float(lo_bound)
     hi_bound = float(hi_bound)
     default = (float(default[0]), float(default[1]))
     step = float(step)
 
+    _init_filter_bounds(col, default)
+    lo_key = f"filter_{col}_lo"
+    hi_key = f"filter_{col}_hi"
+    slider_key = f"filter_{col}_slider"
+    fmt = "%.2f" if step < 1 else "%.0f"
+
     st.markdown(f"**{label}**")
     c1, c2 = st.columns(2)
-    fmt = "%.2f" if step < 1 else "%.0f"
-    lo = c1.number_input(
+    c1.number_input(
         "Min",
         min_value=lo_bound,
         max_value=hi_bound,
-        value=default[0],
         step=step,
         format=fmt,
-        key=f"filter_{col}_lo",
+        key=lo_key,
         disabled=disabled,
     )
-    hi = c2.number_input(
+    c2.number_input(
         "Max",
         min_value=lo_bound,
         max_value=hi_bound,
-        value=default[1],
         step=step,
         format=fmt,
-        key=f"filter_{col}_hi",
+        key=hi_key,
         disabled=disabled,
     )
-    lo, hi = float(min(lo, hi)), float(max(lo, hi))
-    if disabled:
-        return (lo, hi)
 
-    s_lo, s_hi = st.slider(
-        label,
-        lo_bound,
-        hi_bound,
-        (lo, hi),
-        step=step,
-        label_visibility="collapsed",
-        key=f"filter_{col}_slider",
-    )
-    if (s_lo, s_hi) != (lo, hi):
-        return (float(s_lo), float(s_hi))
+    lo = float(min(st.session_state[lo_key], st.session_state[hi_key]))
+    hi = float(max(st.session_state[lo_key], st.session_state[hi_key]))
+
+    if not disabled:
+        if slider_key not in st.session_state:
+            st.session_state[slider_key] = (lo, hi)
+        elif (lo, hi) != tuple(st.session_state[slider_key]):
+            # Number inputs changed — update slider state before the widget is drawn
+            st.session_state[slider_key] = (lo, hi)
+
+        def _sync_slider() -> None:
+            s_lo, s_hi = st.session_state[slider_key]
+            st.session_state[lo_key] = float(s_lo)
+            st.session_state[hi_key] = float(s_hi)
+
+        st.slider(
+            label,
+            lo_bound,
+            hi_bound,
+            step=step,
+            label_visibility="collapsed",
+            key=slider_key,
+            on_change=_sync_slider,
+        )
+
     return (lo, hi)
+
+
+def reset_all_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
+    for col, default in slider_ranges.items():
+        st.session_state[f"filter_{col}_lo"] = float(default[0])
+        st.session_state[f"filter_{col}_hi"] = float(default[1])
+        st.session_state[f"filter_{col}_slider"] = (float(default[0]), float(default[1]))
+    for phase in (1, 2, 3, 4):
+        st.session_state[f"hide_phase_{phase}"] = False
+    st.session_state["hide_patent_yes"] = False
+    st.session_state["hide_patent_no"] = False
 
 
 def render_pubchem_filters(
@@ -497,6 +555,9 @@ def main() -> None:
     with st.sidebar:
         st.header("Property filters")
         st.caption("Type min/max values or drag the slider.")
+        if st.button("Reset all filters"):
+            reset_all_filters(slider_ranges)
+            st.rerun()
         bounds: dict[str, tuple[float, float]] = {}
         for col in BASE_SLIDER_RANGES:
             bounds[col] = render_range_filter(
