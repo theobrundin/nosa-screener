@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pickle
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -14,6 +16,7 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 from chembl_webresource_client.new_client import new_client
+from rdkit import Chem
 from tqdm import tqdm
 
 from enrich_pubchem import PUG_BASE, REQUEST_SLEEP_S, request_json
@@ -26,6 +29,29 @@ OUTPUT_CSV = ROOT / "nosa_drug_database.csv"
 ENRICHED_CSV = ROOT / "nosa_drug_database_enriched.csv"
 CHEMBL_CACHE = ROOT / "chembl_raw_cache.pkl"
 MANUAL_CACHE = ROOT / "manual_compounds_cache.json"
+BATCH_SIZE = 50
+
+METADATA_COLUMNS = [
+    "mesh_heading",
+    "atc_code",
+    "atc_level1",
+    "mechanism_of_action",
+    "mechanism_of_action_all",
+    "target_name",
+    "target_chembl_id",
+    "action_type",
+    "synonyms",
+    "max_synonym_count",
+    "route_of_administration",
+    "dosage_form",
+    "max_clinical_dose_mg",
+    "max_clinical_dose_phase",
+    "dose_feasible_nosa",
+    "pka_predicted",
+    "logD_pH6",
+    "logD_pH74",
+    "ionization_class",
+]
 
 ENRICHMENT_COLUMNS = [
     "pubchem_cid",
@@ -171,6 +197,297 @@ def parse_orange_book_date(value: str) -> pd.Timestamp | pd.NaT:
         return pd.NaT
 
 
+def iter_batches(items: list[str], size: int = BATCH_SIZE) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def pipe_join_unique(values: list[str | None]) -> str | None:
+    seen: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.append(text)
+    return "|".join(seen) if seen else None
+
+
+def _mol_ids_from_record(record: dict[str, Any], key: str = "molecule_chembl_id") -> list[str]:
+    raw = record.get(key)
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    return [str(item) for item in raw if item]
+
+
+def parse_dose_mg(value: Any, units: str | None) -> float | None:
+    if value is None or units is None:
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    unit = str(units).lower().strip()
+    if unit in {"mg", "mg/day", "mg/d", "mg per day"}:
+        return amount
+    if unit in {"g/day", "g/d", "g per day"}:
+        return amount * 1000.0
+    if unit in {"mg kg-1 day-1", "mg/kg/day", "mg kg-1"}:
+        return amount * 70.0
+    return None
+
+
+# RDKit SMARTS-based pKa estimation (dimorphite-dl requires Python 3.10+).
+PKA_PATTERNS: list[tuple[str, float, str]] = [
+    ("[CX3](=O)[OX2H1]", 4.2, "acid"),
+    ("[PX4](=O)([OX2H])[OX2H]", 2.0, "acid"),
+    ("[SX4](=O)(=O)[OX2H]", -1.0, "acid"),
+    ("[#6][OX2H]", 10.0, "acid"),
+    ("[NX4+]", 10.5, "base"),
+    ("[NX3;H2,H1;!$(NC=O);!$(N=O)]", 9.5, "base"),
+    ("[nX3;+]", 5.0, "base"),
+    ("[nX2]", 4.5, "base"),
+    ("[NX3](=O)[OX2H]", 9.0, "acid"),
+]
+
+
+def predict_pka_from_smiles(smiles: str) -> tuple[float | None, str | None]:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None, None
+
+    acidic: list[float] = []
+    basic: list[float] = []
+    for smarts, pka, site_type in PKA_PATTERNS:
+        pattern = Chem.MolFromSmarts(smarts)
+        if pattern and mol.HasSubstructMatch(pattern):
+            if site_type == "acid":
+                acidic.append(pka)
+            else:
+                basic.append(pka)
+
+    if not acidic and not basic:
+        return None, "neutral"
+
+    if acidic and basic:
+        ion_class = "zwitterion"
+        pka = basic[0] if basic else acidic[0]
+    elif basic:
+        ion_class = "base"
+        pka = max(basic)
+    else:
+        ion_class = "acid"
+        pka = min(acidic)
+
+    return pka, ion_class
+
+
+def calculate_logd(logp: float | None, pka: float | None, ion_class: str | None, ph: float) -> float | None:
+    if logp is None or pka is None or ion_class is None:
+        return None
+    if ion_class == "neutral":
+        return logp
+    if ion_class in {"base", "zwitterion"}:
+        return logp - math.log10(1.0 + 10.0 ** (pka - ph))
+    if ion_class == "acid":
+        return logp - math.log10(1.0 + 10.0 ** (ph - pka))
+    return None
+
+
+def add_pka_logd_predictions(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    pka_vals: list[float | None] = []
+    ion_classes: list[str | None] = []
+    logd6: list[float | None] = []
+    logd74: list[float | None] = []
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Predicting pKa/logD"):
+        smiles = row.get("SMILES")
+        logp = _to_float(row.get("logP"))
+        if not isinstance(smiles, str) or not smiles.strip():
+            pka_vals.append(None)
+            ion_classes.append(None)
+            logd6.append(None)
+            logd74.append(None)
+            continue
+        pka, ion_class = predict_pka_from_smiles(smiles.strip())
+        pka_vals.append(pka)
+        ion_classes.append(ion_class)
+        logd6.append(calculate_logd(logp, pka, ion_class, 6.0))
+        logd74.append(calculate_logd(logp, pka, ion_class, 7.4))
+
+    df["pka_predicted"] = pka_vals
+    df["ionization_class"] = ion_classes
+    df["logD_pH6"] = logd6
+    df["logD_pH74"] = logd74
+    return df
+
+
+def enrich_chembl_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    """Batch-fetch ChEMBL drug metadata and annotate the molecule dataframe."""
+    chembl_ids = df["chembl_id"].dropna().astype(str).unique().tolist()
+    if not chembl_ids:
+        return df
+
+    mesh_by_mol: dict[str, list[str]] = {}
+    atc_by_mol: dict[str, list[str]] = {}
+    route_by_mol: dict[str, list[str]] = {}
+    dosage_by_mol: dict[str, list[str]] = {}
+    mech_by_mol: dict[str, list[dict[str, Any]]] = {}
+    dose_by_mol: dict[str, list[float]] = {}
+    synonym_by_mol: dict[str, list[str]] = {}
+
+    drug_indication = new_client.drug_indication
+    drug_resource = new_client.drug
+    mechanism_resource = new_client.mechanism
+    activity_resource = new_client.activity
+    target_resource = new_client.target
+
+    for batch in tqdm(iter_batches(chembl_ids), desc="ChEMBL drug indications (MeSH)"):
+        for rec in drug_indication.filter(molecule_chembl_id__in=batch):
+            mol_id = rec.get("molecule_chembl_id")
+            heading = rec.get("mesh_heading")
+            if mol_id and heading:
+                mesh_by_mol.setdefault(mol_id, []).append(str(heading))
+
+    for batch in tqdm(iter_batches(chembl_ids), desc="ChEMBL drug resource (ATC/routes)"):
+        for rec in drug_resource.filter(molecule_chembl_id__in=batch):
+            mol_id = rec.get("molecule_chembl_id")
+            if not mol_id:
+                continue
+            atc_entries = rec.get("atc_classification") or []
+            for entry in atc_entries:
+                code = entry.get("code") if isinstance(entry, dict) else None
+                if code:
+                    atc_by_mol.setdefault(mol_id, []).append(str(code))
+            forms: list[str] = []
+            if rec.get("oral"):
+                forms.append("oral")
+            if rec.get("parenteral"):
+                forms.append("parenteral")
+            if rec.get("topical"):
+                forms.append("topical")
+            if forms:
+                dosage_by_mol.setdefault(mol_id, []).extend(forms)
+                route_by_mol.setdefault(mol_id, []).append(forms[0])
+
+    for batch in tqdm(iter_batches(chembl_ids), desc="ChEMBL mechanisms"):
+        for rec in mechanism_resource.filter(molecule_chembl_id__in=batch):
+            mol_id = rec.get("molecule_chembl_id")
+            if not mol_id:
+                continue
+            mech_by_mol.setdefault(mol_id, []).append(rec)
+
+    target_ids = {
+        str(rec.get("target_chembl_id"))
+        for recs in mech_by_mol.values()
+        for rec in recs
+        if rec.get("target_chembl_id")
+    }
+    target_names: dict[str, str] = {}
+    target_id_list = sorted(target_ids)
+    for batch in tqdm(iter_batches(target_id_list), desc="ChEMBL targets"):
+        for rec in target_resource.filter(target_chembl_id__in=batch):
+            tid = rec.get("target_chembl_id")
+            if tid:
+                target_names[tid] = rec.get("pref_name") or rec.get("target_type")
+
+    for batch in tqdm(iter_batches(chembl_ids), desc="ChEMBL dose activities"):
+        for rec in activity_resource.filter(
+            molecule_chembl_id__in=batch,
+            standard_type="Dose",
+        ):
+            mol_id = rec.get("molecule_chembl_id")
+            dose_mg = parse_dose_mg(rec.get("standard_value"), rec.get("standard_units"))
+            if mol_id and dose_mg is not None:
+                dose_by_mol.setdefault(mol_id, []).append(dose_mg)
+
+    for _, row in df.iterrows():
+        mol_id = row.get("chembl_id")
+        if not mol_id or pd.isna(mol_id):
+            continue
+        mol_id = str(mol_id)
+        syns = row.get("molecule_synonyms") or []
+        names: list[str] = []
+        if isinstance(syns, list):
+            for entry in syns:
+                if isinstance(entry, dict):
+                    for key in ("molecule_synonym", "synonyms"):
+                        val = entry.get(key)
+                        if val:
+                            names.append(str(val))
+        if names:
+            synonym_by_mol[mol_id] = names
+
+    mesh_final: dict[str, str | None] = {}
+    for mol_id, headings in mesh_by_mol.items():
+        counts = Counter(headings)
+        ordered = [h for h, _ in counts.most_common()]
+        mesh_final[mol_id] = pipe_join_unique(ordered)
+
+    atc_final: dict[str, str | None] = {}
+    atc_l1_final: dict[str, str | None] = {}
+    for mol_id, codes in atc_by_mol.items():
+        atc_final[mol_id] = pipe_join_unique(codes)
+        levels = sorted({code[0] for code in codes if code})
+        atc_l1_final[mol_id] = pipe_join_unique(levels)
+
+    mech_primary: dict[str, str | None] = {}
+    mech_all: dict[str, str | None] = {}
+    target_name_map: dict[str, str | None] = {}
+    target_id_map: dict[str, str | None] = {}
+    action_map: dict[str, str | None] = {}
+    for mol_id, records in mech_by_mol.items():
+        actions = [str(r.get("mechanism_of_action")) for r in records if r.get("mechanism_of_action")]
+        mech_primary[mol_id] = actions[0] if actions else None
+        mech_all[mol_id] = pipe_join_unique(actions)
+        primary = records[0]
+        tid = primary.get("target_chembl_id")
+        target_id_map[mol_id] = tid
+        target_name_map[mol_id] = target_names.get(tid) if tid else None
+        action_map[mol_id] = primary.get("action_type")
+
+    dose_mg_map: dict[str, float | None] = {}
+    for mol_id, doses in dose_by_mol.items():
+        dose_mg_map[mol_id] = max(doses) if doses else None
+
+    df = df.copy()
+    df["mesh_heading"] = df["chembl_id"].map(mesh_final)
+    df["atc_code"] = df["chembl_id"].map(atc_final)
+    df["atc_level1"] = df["chembl_id"].map(atc_l1_final)
+    df["mechanism_of_action"] = df["chembl_id"].map(mech_primary)
+    df["mechanism_of_action_all"] = df["chembl_id"].map(mech_all)
+    df["target_name"] = df["chembl_id"].map(target_name_map)
+    df["target_chembl_id"] = df["chembl_id"].map(target_id_map)
+    df["action_type"] = df["chembl_id"].map(action_map)
+    df["synonyms"] = df["chembl_id"].map(
+        lambda cid: pipe_join_unique(synonym_by_mol.get(str(cid), [])) if pd.notna(cid) else None
+    )
+    df["max_synonym_count"] = df["chembl_id"].map(
+        lambda cid: len(synonym_by_mol.get(str(cid), [])) if pd.notna(cid) else None
+    )
+    df["route_of_administration"] = df["chembl_id"].map(
+        lambda cid: pipe_join_unique(route_by_mol.get(str(cid), [])) if pd.notna(cid) else None
+    )
+    df["dosage_form"] = df["chembl_id"].map(
+        lambda cid: pipe_join_unique(dosage_by_mol.get(str(cid), [])) if pd.notna(cid) else None
+    )
+    df["max_clinical_dose_mg"] = df["chembl_id"].map(dose_mg_map)
+    df["max_clinical_dose_phase"] = df.apply(
+        lambda row: row["chembl_max_phase"]
+        if pd.notna(row.get("max_clinical_dose_mg")) and pd.notna(row.get("chembl_max_phase"))
+        else None,
+        axis=1,
+    )
+    df["dose_feasible_nosa"] = df["max_clinical_dose_mg"].map(
+        lambda dose: True if pd.notna(dose) and dose <= 100 else False if pd.notna(dose) else None
+    )
+
+    print(f"  Molecules with mechanism data: {len(mech_by_mol):,}")
+    return df
+
+
 def fetch_chembl_molecules() -> pd.DataFrame:
     """Pull small molecules with max_phase >= 2 from ChEMBL."""
     molecule = new_client.molecule
@@ -186,6 +503,7 @@ def fetch_chembl_molecules() -> pd.DataFrame:
             "max_phase",
             "molecule_properties",
             "molecule_structures",
+            "molecule_synonyms",
         ]
     )
 
@@ -205,6 +523,7 @@ def fetch_chembl_molecules() -> pd.DataFrame:
                 "H_acceptors": props.get("hba"),
                 "rotatable_bonds": props.get("rtb"),
                 "SMILES": structs.get("canonical_smiles"),
+                "molecule_synonyms": rec.get("molecule_synonyms"),
             }
         )
 
@@ -215,21 +534,17 @@ def fetch_chembl_molecules() -> pd.DataFrame:
 
     indication_by_molecule: dict[str, str] = {}
     chembl_ids = df["chembl_id"].dropna().unique().tolist()
-    batch_size = 50
-    for i in range(0, len(chembl_ids), batch_size):
-        batch = chembl_ids[i : i + batch_size]
+    for batch in iter_batches(chembl_ids):
         for d in drug.filter(molecule_chembl_id__in=batch):
             indication = d.get("indication_class")
             if not indication:
                 continue
-            mol_ids = d.get("molecule_chembl_id") or []
-            if isinstance(mol_ids, str):
-                mol_ids = [mol_ids]
-            for mol_id in mol_ids:
-                if mol_id and mol_id not in indication_by_molecule:
+            for mol_id in _mol_ids_from_record(d):
+                if mol_id not in indication_by_molecule:
                     indication_by_molecule[mol_id] = indication
 
     df["indication_class"] = df["chembl_id"].map(indication_by_molecule)
+    df = enrich_chembl_metadata(df)
     return df
 
 
@@ -480,6 +795,15 @@ def print_build_summary(stats: dict[str, int]) -> None:
     print(f"  SMILES filled from DrugCentral: {stats['smiles_filled']:>6,}")
     print(f"  EMA approved flags set:        {stats['ema_flags']:>7,}")
     print(f"  PMDA approved flags set:       {stats['pmda_flags']:>7,}")
+    print(f"  Mechanism of action data:      {stats['mechanism_rows']:>7,}")
+    print(f"  ATC codes:                     {stats['atc_rows']:>7,}")
+    print(f"  MeSH headings:                 {stats['mesh_rows']:>7,}")
+    print(f"  pKa predicted:                 {stats['pka_rows']:>7,}")
+    print(f"  logD calculated:               {stats['logd_rows']:>7,}")
+    print(f"  Dose data available:           {stats['dose_rows']:>7,}")
+    print(f"  Dose ≤ 100mg (NOSA feasible):  {stats['dose_feasible']:>7,}")
+    print(f"  Dose > 100mg (excluded):       {stats['dose_excluded']:>7,}")
+    print(f"  Dose unknown:                  {stats['dose_unknown']:>7,}")
     print("  ────────────────────────────────────────────────")
     print(f"  TOTAL ROWS:                    {stats['total_rows']:>7,}")
     print(f"  Output → {OUTPUT_CSV.name}")
@@ -498,6 +822,15 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "smiles_filled": 0,
         "ema_flags": 0,
         "pmda_flags": 0,
+        "mechanism_rows": 0,
+        "atc_rows": 0,
+        "mesh_rows": 0,
+        "pka_rows": 0,
+        "logd_rows": 0,
+        "dose_rows": 0,
+        "dose_feasible": 0,
+        "dose_excluded": 0,
+        "dose_unknown": 0,
         "total_rows": 0,
     }
 
@@ -551,6 +884,9 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     merged, stats["smiles_filled"] = fill_smiles_from_drugcentral(merged, structures)
     print(f"  SMILES filled from DrugCentral: {stats['smiles_filled']:,}")
 
+    print("Calculating predicted pKa and logD from SMILES...")
+    merged = add_pka_logd_predictions(merged)
+
     merged = flag_nosa_candidates(merged)
     merged, stats["enriched_carried"] = carry_forward_enrichment(merged)
     print(f"  Enriched rows carried forward: {stats['enriched_carried']:,}")
@@ -560,12 +896,26 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "chembl_id",
         "chembl_max_phase",
         "indication_class",
+        "mesh_heading",
+        "atc_code",
+        "atc_level1",
+        "mechanism_of_action",
+        "mechanism_of_action_all",
+        "target_name",
+        "target_chembl_id",
+        "action_type",
+        "synonyms",
+        "max_synonym_count",
         "molecular_weight",
         "logP",
         "PSA",
         "H_donors",
         "H_acceptors",
         "rotatable_bonds",
+        "pka_predicted",
+        "logD_pH6",
+        "logD_pH74",
+        "ionization_class",
         "SMILES",
         "smiles_source",
         "source",
@@ -575,6 +925,11 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "earliest_exclusivity_date",
         "ema_approved",
         "pmda_approved",
+        "route_of_administration",
+        "dosage_form",
+        "max_clinical_dose_mg",
+        "max_clinical_dose_phase",
+        "dose_feasible_nosa",
         "nosa_candidate",
         *ENRICHMENT_COLUMNS,
     ]
@@ -582,6 +937,16 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         if col not in merged.columns:
             merged[col] = None
     merged = merged[column_order]
+
+    stats["mechanism_rows"] = int(merged["mechanism_of_action"].notna().sum())
+    stats["atc_rows"] = int(merged["atc_code"].notna().sum())
+    stats["mesh_rows"] = int(merged["mesh_heading"].notna().sum())
+    stats["pka_rows"] = int(merged["pka_predicted"].notna().sum())
+    stats["logd_rows"] = int(merged["logD_pH6"].notna().sum())
+    stats["dose_rows"] = int(merged["max_clinical_dose_mg"].notna().sum())
+    stats["dose_feasible"] = int((merged["dose_feasible_nosa"] == True).sum())
+    stats["dose_excluded"] = int((merged["dose_feasible_nosa"] == False).sum())
+    stats["dose_unknown"] = int(merged["dose_feasible_nosa"].isna().sum())
     stats["total_rows"] = len(merged)
     return merged, stats
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
@@ -47,7 +48,14 @@ PUBCHEM_SLIDER_RANGES = {
     "melting_point_c": (-100, 400),
 }
 
+CLINICAL_SLIDER_RANGES = {
+    "pka_predicted": (-5, 14),
+    "logD_pH6": (-5, 8),
+    "max_clinical_dose_mg": (0, 500),
+}
+
 PUBCHEM_COLUMNS = list(PUBCHEM_SLIDER_RANGES.keys())
+CLINICAL_COLUMNS = list(CLINICAL_SLIDER_RANGES.keys())
 
 FILTER_LABELS = {
     "molecular_weight": "Molecular weight (Da)",
@@ -57,6 +65,9 @@ FILTER_LABELS = {
     "rotatable_bonds": "Rotatable bonds",
     "vapor_pressure_mmhg": "Vapor pressure (mmHg)",
     "melting_point_c": "Melting point (°C)",
+    "pka_predicted": "pKa (predicted) — Stanko filter: 3–10",
+    "logD_pH6": "logD at nasal pH 6.0",
+    "max_clinical_dose_mg": "Max clinical dose (mg) — NOSA limit: 100 mg",
 }
 
 FILTER_STEPS = {
@@ -67,6 +78,15 @@ FILTER_STEPS = {
     "rotatable_bonds": 1.0,
     "vapor_pressure_mmhg": 0.01,
     "melting_point_c": 1.0,
+    "pka_predicted": 0.1,
+    "logD_pH6": 0.1,
+    "max_clinical_dose_mg": 1.0,
+}
+
+CLINICAL_DEFAULTS = {
+    "pka_predicted": (3.0, 10.0),
+    "logD_pH6": (1.0, 4.0),
+    "max_clinical_dose_mg": (0.0, 100.0),
 }
 
 
@@ -161,15 +181,25 @@ def inject_styles() -> None:
     )
 
 
+def has_clinical_data(df: pd.DataFrame) -> bool:
+    return "pka_predicted" in df.columns and "logD_pH6" in df.columns
+
+
 @st.cache_data
 def load_database(path_str: str) -> pd.DataFrame:
     df = pd.read_csv(path_str)
-    numeric_cols = list(BASE_IDEAL.keys()) + PUBCHEM_COLUMNS
+    numeric_cols = list(BASE_IDEAL.keys()) + PUBCHEM_COLUMNS + CLINICAL_COLUMNS
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "nosa_candidate" in df.columns:
         df["nosa_candidate"] = df["nosa_candidate"].fillna(False).astype(bool)
+    if "dose_feasible_nosa" in df.columns:
+        df["dose_feasible_nosa"] = df["dose_feasible_nosa"].map(
+            lambda v: True if v is True or str(v).lower() == "true"
+            else False if v is False or str(v).lower() == "false"
+            else None
+        )
     return df
 
 
@@ -179,6 +209,15 @@ def active_score_config(df: pd.DataFrame) -> tuple[dict[str, float], dict[str, t
     if has_pubchem_data(df):
         ideal.update(PUBCHEM_IDEAL)
         ranges.update(PUBCHEM_SLIDER_RANGES)
+    if has_clinical_data(df):
+        ideal.update(
+            {
+                "pka_predicted": 6.5,
+                "logD_pH6": 2.5,
+                "max_clinical_dose_mg": 50.0,
+            }
+        )
+        ranges.update(CLINICAL_SLIDER_RANGES)
     return ideal, ranges
 
 
@@ -192,28 +231,93 @@ def composite_score(
     ideal: dict[str, float],
     ranges: dict[str, tuple[float, float]],
 ) -> pd.Series:
-    score_cols = [c for c in ideal if c in df.columns]
+    score_cols = [c for c in ideal if c in df.columns and c != "max_clinical_dose_mg"]
     if not score_cols:
         return pd.Series(0.0, index=df.index)
     scores = []
     for col in score_cols:
         lo, hi = ranges[col]
         scores.append(property_score(df[col], ideal[col], hi - lo))
-    return sum(scores) / len(scores)
+
+    if "max_clinical_dose_mg" in df.columns:
+        dose_score = df["max_clinical_dose_mg"].map(
+            lambda dose: 100.0
+            if pd.notna(dose) and dose <= 100
+            else 0.0
+            if pd.notna(dose)
+            else 50.0
+        )
+        scores.append(dose_score)
+
+    total = sum(scores) / len(scores)
+    if "max_clinical_dose_mg" in df.columns:
+        completeness_bonus = df["max_clinical_dose_mg"].notna().astype(float) * 3.0
+        return (total + completeness_bonus).clip(upper=100.0)
+    return total
 
 
-def apply_filters(df: pd.DataFrame, bounds: dict[str, tuple[float, float]]) -> pd.DataFrame:
+def apply_filters(
+    df: pd.DataFrame,
+    bounds: dict[str, tuple[float, float]],
+    default_bounds: dict[str, tuple[float, float]] | None = None,
+) -> pd.DataFrame:
     mask = pd.Series(True, index=df.index)
     pubchem_cols = set(PUBCHEM_COLUMNS)
+    sparse_clinical = {"max_clinical_dose_mg"}
+    defaults = default_bounds or bounds
     for col, (lo, hi) in bounds.items():
         if col not in df.columns:
             continue
         in_range = df[col].between(lo, hi)
-        if col in pubchem_cols:
-            # Sparse PubChem data: missing values pass but score 0 in composite
-            mask &= df[col].isna() | in_range
+        def_lo, def_hi = defaults.get(col, (lo, hi))
+        narrowed = lo > def_lo or hi < def_hi
+        if col in pubchem_cols or col in sparse_clinical:
+            if narrowed:
+                mask &= df[col].notna() & in_range
+            else:
+                mask &= df[col].isna() | in_range
         else:
             mask &= df[col].notna() & in_range
+    return df.loc[mask].copy()
+
+
+def _split_pipe_values(value: Any) -> list[str]:
+    if pd.isna(value) or not str(value).strip():
+        return []
+    return [part.strip() for part in str(value).split("|") if part.strip()]
+
+
+def apply_categorical_filters(
+    df: pd.DataFrame,
+    routes: list[str] | None,
+    atc_levels: list[str] | None,
+    all_routes: list[str],
+    all_atc_levels: list[str],
+) -> pd.DataFrame:
+    mask = pd.Series(True, index=df.index)
+
+    if routes is not None and len(routes) < len(all_routes) and "route_of_administration" in df.columns:
+        selected = set(routes)
+
+        def route_match(value: Any) -> bool:
+            parts = _split_pipe_values(value)
+            return bool(parts) and any(part in selected for part in parts)
+
+        mask &= df["route_of_administration"].map(route_match)
+
+    if (
+        atc_levels is not None
+        and len(atc_levels) < len(all_atc_levels)
+        and "atc_level1" in df.columns
+    ):
+        selected = set(atc_levels)
+
+        def atc_match(value: Any) -> bool:
+            parts = _split_pipe_values(value)
+            return bool(parts) and any(part in selected for part in parts)
+
+        mask &= df["atc_level1"].map(atc_match)
+
     return df.loc[mask].copy()
 
 
@@ -293,6 +397,17 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "rotatable_bonds",
         "vapor_pressure_mmhg",
         "melting_point_c",
+        "pka_predicted",
+        "logD_pH6",
+        "logD_pH74",
+        "max_clinical_dose_mg",
+        "dose_feasible_nosa",
+        "atc_code",
+        "mesh_heading",
+        "mechanism_of_action",
+        "target_name",
+        "dosage_form",
+        "synonyms",
         "nosa_candidate",
         "indication_class",
         "earliest_patent_expiry",
@@ -304,10 +419,39 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         shown["chembl_max_phase"] = shown["chembl_max_phase"].apply(
             lambda v: int(v) if pd.notna(v) else "—"
         )
-    for col in ["molecular_weight", "logP", "PSA", "vapor_pressure_mmhg", "melting_point_c"]:
+    if "dose_feasible_nosa" in shown.columns:
+        shown["dose_feasible_nosa"] = shown["dose_feasible_nosa"].map(
+            lambda v: "✓" if v is True else "✗" if v is False else "?"
+        )
+    for col in [
+        "molecular_weight",
+        "logP",
+        "PSA",
+        "vapor_pressure_mmhg",
+        "melting_point_c",
+        "pka_predicted",
+        "logD_pH6",
+        "logD_pH74",
+        "max_clinical_dose_mg",
+    ]:
         if col in shown.columns:
             shown[col] = shown[col].round(2)
-    return shown.style.apply(highlight_nosa, axis=1).format(
+
+    def dose_badge_style(row: pd.Series) -> list[str]:
+        base = highlight_nosa(row)
+        if "dose_feasible_nosa" not in row.index:
+            return base
+        badge = row["dose_feasible_nosa"]
+        dose_idx = list(row.index).index("dose_feasible_nosa")
+        if badge == "✓":
+            base[dose_idx] = f"background-color: #2E8B57; color: {TEXT}; font-weight: 700"
+        elif badge == "✗":
+            base[dose_idx] = f"background-color: #C0392B; color: {TEXT}; font-weight: 700"
+        elif badge == "?":
+            base[dose_idx] = f"background-color: {DISABLED}; color: {TEXT}; font-weight: 700"
+        return base
+
+    return shown.style.apply(dose_badge_style, axis=1).format(
         {"composite_score": "{:.1f}"},
         na_rep="—",
     )
@@ -449,7 +593,10 @@ def render_range_filter(
             on_change=_sync_slider,
         )
 
-    return (lo, hi)
+    return (
+        float(min(st.session_state[lo_key], st.session_state[hi_key])),
+        float(max(st.session_state[lo_key], st.session_state[hi_key])),
+    )
 
 
 def reset_all_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
@@ -457,6 +604,11 @@ def reset_all_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
         st.session_state[f"filter_{col}_lo"] = float(default[0])
         st.session_state[f"filter_{col}_hi"] = float(default[1])
         st.session_state[f"filter_{col}_slider"] = (float(default[0]), float(default[1]))
+    for col, default in CLINICAL_DEFAULTS.items():
+        if col in slider_ranges:
+            st.session_state[f"filter_{col}_lo"] = float(default[0])
+            st.session_state[f"filter_{col}_hi"] = float(default[1])
+            st.session_state[f"filter_{col}_slider"] = (float(default[0]), float(default[1]))
     for phase in (1, 2, 3, 4):
         st.session_state[f"hide_phase_{phase}"] = False
     st.session_state["hide_patent_yes"] = False
@@ -505,11 +657,67 @@ def render_pubchem_filters(
         FILTER_STEPS["melting_point_c"],
     )
     st.markdown(
+        '<p class="nosa-note">Narrowing VP or MP excludes drugs missing that property.</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
         '<p class="nosa-warning">Injection molding reaches ~150–250°C — drugs '
         "melting below 150°C are thermal stability risks</p>",
         unsafe_allow_html=True,
     )
     return bounds
+
+
+def unique_pipe_values(series: pd.Series) -> list[str]:
+    values: list[str] = []
+    for item in series.dropna():
+        values.extend(_split_pipe_values(item))
+    return sorted(set(values))
+
+
+def render_clinical_filters(
+    df: pd.DataFrame,
+    slider_ranges: dict[str, tuple[float, float]],
+) -> tuple[dict[str, tuple[float, float]], list[str], list[str]]:
+    bounds: dict[str, tuple[float, float]] = {}
+    if not has_clinical_data(df):
+        st.subheader("Clinical / ADME filters")
+        st.markdown(
+            '<p class="nosa-disabled">Rebuild database to enable pKa, logD, and dose filters.</p>',
+            unsafe_allow_html=True,
+        )
+        return bounds, [], []
+
+    st.subheader("Clinical / ADME filters")
+    for col in CLINICAL_COLUMNS:
+        default = CLINICAL_DEFAULTS.get(col, slider_ranges[col])
+        bounds[col] = render_range_filter(
+            col,
+            FILTER_LABELS[col],
+            *slider_ranges[col],
+            default,
+            FILTER_STEPS[col],
+        )
+
+    all_routes = unique_pipe_values(df["route_of_administration"]) if "route_of_administration" in df.columns else []
+    all_atc = unique_pipe_values(df["atc_level1"]) if "atc_level1" in df.columns else []
+
+    selected_routes = all_routes
+    selected_atc = all_atc
+    if all_routes:
+        selected_routes = st.multiselect(
+            "Route of administration",
+            options=all_routes,
+            default=all_routes,
+        )
+    if all_atc:
+        selected_atc = st.multiselect(
+            "ATC level 1 (therapeutic area)",
+            options=all_atc,
+            default=all_atc,
+        )
+
+    return bounds, selected_routes, selected_atc
 
 
 def benchmark_text(ideal: dict[str, float], n_criteria: int) -> str:
@@ -524,6 +732,12 @@ def benchmark_text(ideal: dict[str, float], n_criteria: int) -> str:
         parts.append(f"VP {ideal['vapor_pressure_mmhg']:.2f} mmHg")
     if "melting_point_c" in ideal:
         parts.append(f"MP {ideal['melting_point_c']:.0f} °C")
+    if "pka_predicted" in ideal:
+        parts.append(f"pKa {ideal['pka_predicted']:.1f}")
+    if "logD_pH6" in ideal:
+        parts.append(f"logD₆ {ideal['logD_pH6']:.1f}")
+    if "max_clinical_dose_mg" in ideal:
+        parts.append(f"Dose {ideal['max_clinical_dose_mg']:.0f} mg")
     return " · ".join(parts) + f" ({n_criteria} criteria)"
 
 
@@ -540,7 +754,11 @@ def main() -> None:
     df = load_database(str(path))
     pubchem_available = has_pubchem_data(df)
     ideal, slider_ranges = active_score_config(df)
-    n_criteria = len(ideal)
+    default_bounds = {**BASE_SLIDER_RANGES, **PUBCHEM_SLIDER_RANGES, **CLINICAL_SLIDER_RANGES}
+    for col, bounds in CLINICAL_DEFAULTS.items():
+        if col in slider_ranges:
+            default_bounds[col] = bounds
+    n_criteria = len(ideal) + (1 if "max_clinical_dose_mg" in df.columns else 0)
 
     st.title("NOSA Drug Screener")
     st.caption(
@@ -572,13 +790,22 @@ def main() -> None:
         bounds.update(render_pubchem_filters(pubchem_available, slider_ranges))
 
         st.divider()
+        clinical_bounds, selected_routes, selected_atc = render_clinical_filters(df, slider_ranges)
+        bounds.update(clinical_bounds)
+        all_routes = unique_pipe_values(df["route_of_administration"]) if "route_of_administration" in df.columns else []
+        all_atc = unique_pipe_values(df["atc_level1"]) if "atc_level1" in df.columns else []
+
+        st.divider()
         hide_phases, hide_with_patent, hide_without_patent = render_metadata_filters(df)
 
         st.divider()
         st.markdown("**Memantine benchmark**")
         st.markdown(benchmark_text(ideal, n_criteria))
 
-    filtered = apply_filters(df, bounds)
+    filtered = apply_filters(df, bounds, default_bounds)
+    filtered = apply_categorical_filters(
+        filtered, selected_routes, selected_atc, all_routes, all_atc
+    )
     filtered = apply_metadata_filters(
         filtered, hide_phases, hide_with_patent, hide_without_patent
     )
