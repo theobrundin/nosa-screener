@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent
 ORANGE_BOOK_DIR = ROOT / "EOBZIP_2026_04"
 REGULATORY_CSV = ROOT / "FDA+EMA+PMDA_Approved.csv"
 STRUCTURES_TSV = ROOT / "structures.smiles.tsv"
+DRUGBANK_CSV = ROOT / "kaggle-drugbank" / "drugbank_clean.csv"
 OUTPUT_CSV = ROOT / "nosa_drug_database.csv"
 ENRICHED_CSV = ROOT / "nosa_drug_database_enriched.csv"
 CHEMBL_CACHE = ROOT / "chembl_raw_cache.pkl"
@@ -783,6 +784,202 @@ def flag_nosa_candidates(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+DRUGBANK_PK_MAP = {
+    "absorption": "absorption",
+    "half-life": "half_life",
+    "protein-binding": "protein_binding",
+    "metabolism": "metabolism",
+    "route-of-elimination": "route_of_elimination",
+    "volume-of-distribution": "volume_of_distribution",
+    "clearance": "clearance",
+    "toxicity": "toxicity",
+}
+
+CHEMBL_PRIMARY_FIELDS = {
+    "molecular_weight",
+    "logP",
+    "PSA",
+    "H_donors",
+    "H_acceptors",
+    "rotatable_bonds",
+    "SMILES",
+    "max_clinical_dose_mg",
+    "dosage_form",
+    "chembl_max_phase",
+}
+
+
+def normalize_text(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return re.sub(r"\s+", " ", str(value).lower().strip())
+
+
+def values_meaningfully_differ(left: Any, right: Any) -> bool:
+    a = normalize_text(left)
+    b = normalize_text(right)
+    if not a or not b:
+        return False
+    return a != b
+
+
+def _clean_db_value(value: Any) -> Any:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return text if text else None
+
+
+def load_drugbank() -> pd.DataFrame:
+    """Load Kaggle DrugBank export indexed by normalized drug name."""
+    if not DRUGBANK_CSV.exists():
+        print(f"  DrugBank file not found: {DRUGBANK_CSV}")
+        return pd.DataFrame()
+
+    db = pd.read_csv(DRUGBANK_CSV, low_memory=False)
+    db["name_key"] = db["name"].map(normalize_name)
+    db = db[db["name_key"] != ""].copy()
+    db["_richness"] = db.notna().sum(axis=1)
+    db = db.sort_values("_richness", ascending=False)
+    db = db.drop_duplicates(subset="name_key", keep="first")
+    db = db.drop(columns=["_richness"])
+    print(f"  DrugBank records indexed: {len(db):,}")
+    return db
+
+
+def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Apply field-level DrugBank vs ChEMBL source priority with conflict tracking."""
+    stats = {
+        "mechanism_drugbank_primary": 0,
+        "mechanism_chembl_fallback": 0,
+        "mechanism_conflicts": 0,
+        "indication_conflicts": 0,
+        "mw_conflicts": 0,
+        "physical_state_populated": 0,
+        "pk_populated": 0,
+        "drugbank_matches": 0,
+    }
+
+    df = df.copy()
+    for col in [
+        "physical_state",
+        *DRUGBANK_PK_MAP.values(),
+        "mechanism_of_action_chembl",
+        "mechanism_of_action_conflict",
+        "indication_class_chembl",
+        "indication_class_conflict",
+        "molecular_weight_db",
+        "mw_conflict",
+        "field_sources",
+        "drugbank_id",
+    ]:
+        if col not in df.columns:
+            df[col] = None
+
+    if drugbank.empty:
+        df["field_sources"] = df.apply(lambda _: json.dumps({}), axis=1)
+        return df, stats
+
+    db_by_key = drugbank.set_index("name_key", drop=False)
+
+    def merge_row(row: pd.Series) -> pd.Series:
+        sources: dict[str, str] = {}
+        chembl_mechanism = _clean_db_value(row.get("mechanism_of_action"))
+        chembl_indication = _clean_db_value(row.get("indication_class"))
+        chembl_mw = _to_float(row.get("molecular_weight"))
+
+        for field in CHEMBL_PRIMARY_FIELDS:
+            if field == "chembl_max_phase":
+                if pd.notna(row.get("chembl_max_phase")):
+                    sources["max_phase"] = "chembl"
+            elif pd.notna(row.get(field)) and str(row.get(field)).strip() != "":
+                sources[field] = "chembl"
+
+        if row["name_key"] not in db_by_key.index:
+            row["field_sources"] = json.dumps(sources, sort_keys=True)
+            return row
+
+        stats["drugbank_matches"] += 1
+        db_row = db_by_key.loc[row["name_key"]]
+        if isinstance(db_row, pd.DataFrame):
+            db_row = db_row.iloc[0]
+
+        row["drugbank_id"] = _clean_db_value(db_row.get("drugbank-id"))
+        row["sources"] = add_source(row.get("sources"), "drugbank")
+
+        db_mechanism = _clean_db_value(db_row.get("mechanism-of-action"))
+        db_indication = _clean_db_value(db_row.get("indication"))
+        db_state = _clean_db_value(db_row.get("state"))
+        db_mass = _to_float(db_row.get("average-mass"))
+
+        if db_mechanism:
+            row["mechanism_of_action"] = db_mechanism
+            sources["mechanism_of_action"] = "drugbank"
+            stats["mechanism_drugbank_primary"] += 1
+            if chembl_mechanism and values_meaningfully_differ(db_mechanism, chembl_mechanism):
+                row["mechanism_of_action_chembl"] = chembl_mechanism
+                row["mechanism_of_action_conflict"] = True
+                stats["mechanism_conflicts"] += 1
+        elif chembl_mechanism:
+            row["mechanism_of_action"] = chembl_mechanism
+            sources["mechanism_of_action"] = "chembl"
+            stats["mechanism_chembl_fallback"] += 1
+
+        if db_indication:
+            row["indication_class"] = db_indication
+            sources["indication_class"] = "drugbank"
+            if chembl_indication and values_meaningfully_differ(db_indication, chembl_indication):
+                row["indication_class_chembl"] = chembl_indication
+                row["indication_class_conflict"] = True
+                stats["indication_conflicts"] += 1
+        elif chembl_indication:
+            row["indication_class"] = chembl_indication
+            sources["indication_class"] = "chembl"
+
+        if db_state:
+            row["physical_state"] = db_state
+            sources["physical_state"] = "drugbank"
+            stats["physical_state_populated"] += 1
+
+        if db_mass is not None and chembl_mw is not None and abs(db_mass - chembl_mw) > 1.0:
+            row["molecular_weight_db"] = db_mass
+            row["mw_conflict"] = True
+            stats["mw_conflicts"] += 1
+        elif db_mass is not None:
+            row["molecular_weight_db"] = db_mass
+
+        pk_any = False
+        for db_col, out_col in DRUGBANK_PK_MAP.items():
+            value = _clean_db_value(db_row.get(db_col))
+            if value is not None:
+                row[out_col] = value
+                sources[out_col] = "drugbank"
+                pk_any = True
+        if pk_any:
+            stats["pk_populated"] += 1
+
+        row["field_sources"] = json.dumps(sources, sort_keys=True)
+        return row
+
+    # Use explicit loop so stats mutate correctly (apply with closure is awkward for counters)
+    rows_out: list[pd.Series] = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Merging DrugBank priorities"):
+        rows_out.append(merge_row(row.copy()))
+    return pd.DataFrame(rows_out), stats
+
+
+def print_drugbank_summary(stats: dict[str, int]) -> None:
+    print("\n── Source priority & conflicts ───────────────────")
+    print(f"  DrugBank name matches:           {stats.get('drugbank_matches', 0):>7,}")
+    print(f"  Mechanism: DrugBank primary     {stats.get('mechanism_drugbank_primary', 0):>7,}")
+    print(f"  Mechanism: ChEMBL fallback used  {stats.get('mechanism_chembl_fallback', 0):>7,}")
+    print(f"  Mechanism conflicts flagged      {stats.get('mechanism_conflicts', 0):>7,}")
+    print(f"  Indication conflicts flagged     {stats.get('indication_conflicts', 0):>7,}")
+    print(f"  MW conflicts (>1 Da difference)  {stats.get('mw_conflicts', 0):>7,}")
+    print(f"  Physical state (DrugBank only)   {stats.get('physical_state_populated', 0):>7,}")
+    print(f"  PK fields populated (DrugBank)   {stats.get('pk_populated', 0):>7,}")
+
+
 def print_build_summary(stats: dict[str, int]) -> None:
     new_rows = stats["total_rows"] - stats["enriched_carried"]
     print("\n── Build summary ──────────────────────────────────")
@@ -884,6 +1081,10 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     merged, stats["smiles_filled"] = fill_smiles_from_drugcentral(merged, structures)
     print(f"  SMILES filled from DrugCentral: {stats['smiles_filled']:,}")
 
+    drugbank = load_drugbank()
+    merged, drugbank_stats = merge_drugbank_priorities(merged, drugbank)
+    stats.update(drugbank_stats)
+
     print("Calculating predicted pKa and logD from SMILES...")
     merged = add_pka_logd_predictions(merged)
 
@@ -897,16 +1098,22 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "chembl_max_phase",
         "indication_class",
         "mesh_heading",
+        "indication_class_chembl",
+        "indication_class_conflict",
         "atc_code",
         "atc_level1",
         "mechanism_of_action",
         "mechanism_of_action_all",
+        "mechanism_of_action_chembl",
+        "mechanism_of_action_conflict",
         "target_name",
         "target_chembl_id",
         "action_type",
         "synonyms",
         "max_synonym_count",
         "molecular_weight",
+        "molecular_weight_db",
+        "mw_conflict",
         "logP",
         "PSA",
         "H_donors",
@@ -916,6 +1123,15 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "logD_pH6",
         "logD_pH74",
         "ionization_class",
+        "physical_state",
+        "absorption",
+        "half_life",
+        "protein_binding",
+        "metabolism",
+        "route_of_elimination",
+        "volume_of_distribution",
+        "clearance",
+        "toxicity",
         "SMILES",
         "smiles_source",
         "source",
@@ -930,6 +1146,8 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "max_clinical_dose_mg",
         "max_clinical_dose_phase",
         "dose_feasible_nosa",
+        "drugbank_id",
+        "field_sources",
         "nosa_candidate",
         *ENRICHMENT_COLUMNS,
     ]
@@ -956,6 +1174,7 @@ def main() -> None:
     df, stats = build_database(skip_chembl=args.skip_chembl)
     df.to_csv(OUTPUT_CSV, index=False)
     print_build_summary(stats)
+    print_drugbank_summary(stats)
 
 
 if __name__ == "__main__":

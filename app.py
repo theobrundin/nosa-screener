@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -377,6 +378,51 @@ def render_metadata_filters(df: pd.DataFrame) -> tuple[set[int], bool, bool]:
     return hide_phases, hide_with_patent, hide_without_patent
 
 
+def parse_field_sources(value: Any) -> dict[str, str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def source_badge(field: str, field_sources: dict[str, str]) -> str:
+    source = field_sources.get(field, "")
+    if source == "drugbank":
+        return "DB"
+    if source == "chembl":
+        return "C"
+    return ""
+
+
+def format_value_with_badge(
+    value: Any,
+    field: str,
+    field_sources: dict[str, str],
+    *,
+    precision: int | None = None,
+    conflict: bool = False,
+    alt_value: Any = None,
+    alt_label: str = "ChEMBL",
+) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+    text = f"{value:.{precision}f}" if precision is not None else str(value)
+    badge = source_badge(field, field_sources)
+    if badge:
+        text = f"{text} [{badge}]"
+    if conflict:
+        alt_text = str(alt_value)[:80] + ("…" if alt_value and len(str(alt_value)) > 80 else "")
+        text = f"⚠️ {text}"
+        if alt_value is not None and not (isinstance(alt_value, float) and pd.isna(alt_value)):
+            text = f"{text} ({alt_label}: {alt_text})"
+    return text
+
+
 def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     def highlight_nosa(row: pd.Series) -> list[str]:
         if row.get("nosa_candidate"):
@@ -406,6 +452,8 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "mesh_heading",
         "mechanism_of_action",
         "target_name",
+        "physical_state",
+        "half_life",
         "dosage_form",
         "synonyms",
         "nosa_candidate",
@@ -415,6 +463,10 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     display_cols = [c for c in display_cols if c in df.columns]
     shown = df[display_cols].copy()
     shown["composite_score"] = shown["composite_score"].round(1)
+
+    field_sources_list = df["field_sources"].map(parse_field_sources) if "field_sources" in df.columns else [{}] * len(df)
+    field_sources_list = list(field_sources_list)
+
     if "chembl_max_phase" in shown.columns:
         shown["chembl_max_phase"] = shown["chembl_max_phase"].apply(
             lambda v: int(v) if pd.notna(v) else "—"
@@ -423,17 +475,54 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         shown["dose_feasible_nosa"] = shown["dose_feasible_nosa"].map(
             lambda v: "✓" if v is True else "✗" if v is False else "?"
         )
-    for col in [
-        "molecular_weight",
-        "logP",
-        "PSA",
-        "vapor_pressure_mmhg",
-        "melting_point_c",
-        "pka_predicted",
-        "logD_pH6",
-        "logD_pH74",
-        "max_clinical_dose_mg",
-    ]:
+
+    for idx, row in df.iterrows():
+        pos = df.index.get_loc(idx)
+        fs = field_sources_list[pos] if pos < len(field_sources_list) else {}
+        if "molecular_weight" in shown.columns and pd.notna(row.get("molecular_weight")):
+            shown.at[idx, "molecular_weight"] = format_value_with_badge(
+                round(float(row["molecular_weight"]), 2),
+                "molecular_weight",
+                fs,
+                conflict=bool(row.get("mw_conflict")),
+                alt_value=row.get("molecular_weight_db"),
+                alt_label="DrugBank",
+            )
+        if "logP" in shown.columns and pd.notna(row.get("logP")):
+            shown.at[idx, "logP"] = format_value_with_badge(row["logP"], "logP", fs, precision=2)
+        if "mechanism_of_action" in shown.columns and pd.notna(row.get("mechanism_of_action")):
+            mech = str(row["mechanism_of_action"])
+            if len(mech) > 60:
+                mech = mech[:57] + "…"
+            shown.at[idx, "mechanism_of_action"] = format_value_with_badge(
+                mech,
+                "mechanism_of_action",
+                fs,
+                conflict=bool(row.get("mechanism_of_action_conflict")),
+                alt_value=row.get("mechanism_of_action_chembl"),
+            )
+        if "indication_class" in shown.columns and pd.notna(row.get("indication_class")):
+            ind = str(row["indication_class"])
+            if len(ind) > 60:
+                ind = ind[:57] + "…"
+            shown.at[idx, "indication_class"] = format_value_with_badge(
+                ind,
+                "indication_class",
+                fs,
+                conflict=bool(row.get("indication_class_conflict")),
+                alt_value=row.get("indication_class_chembl"),
+            )
+        for col in ["pka_predicted", "logD_pH6", "logD_pH74", "max_clinical_dose_mg"]:
+            if col in shown.columns and pd.notna(row.get(col)):
+                shown.at[idx, col] = format_value_with_badge(row[col], col, fs, precision=2)
+        for col in ["physical_state", "half_life"]:
+            if col in shown.columns and pd.notna(row.get(col)):
+                val = str(row[col])
+                if len(val) > 50:
+                    val = val[:47] + "…"
+                shown.at[idx, col] = format_value_with_badge(val, col, fs)
+
+    for col in ["PSA", "vapor_pressure_mmhg", "melting_point_c"]:
         if col in shown.columns:
             shown[col] = shown[col].round(2)
 
@@ -455,6 +544,65 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         {"composite_score": "{:.1f}"},
         na_rep="—",
     )
+
+
+def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
+    if filtered.empty:
+        return
+
+    with st.expander("Drug detail & data sources", expanded=False):
+        st.caption("C = ChEMBL · DB = DrugBank · ⚠️ = conflicting values between sources")
+        names = filtered["name"].tolist()
+        selected = st.selectbox("Select drug", names, key="detail_drug_select")
+        row = filtered.loc[filtered["name"] == selected].iloc[0]
+        sources = parse_field_sources(row.get("field_sources"))
+
+        st.markdown(f"**{selected}**")
+        if row.get("drugbank_id"):
+            st.markdown(f"DrugBank ID: `{row['drugbank_id']}`")
+        if row.get("chembl_id"):
+            st.markdown(f"ChEMBL ID: `{row['chembl_id']}`")
+
+        st.markdown("**Data sources**")
+        if sources:
+            source_rows = [{"Field": k, "Source": v.upper() if v == "drugbank" else v.title()} for k, v in sorted(sources.items())]
+            st.dataframe(pd.DataFrame(source_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No source mapping recorded for this compound.")
+
+        conflicts: list[str] = []
+        if row.get("mechanism_of_action_conflict"):
+            conflicts.append(
+                f"**Mechanism** — shown: DrugBank · alternate ChEMBL: {row.get('mechanism_of_action_chembl', '—')}"
+            )
+        if row.get("indication_class_conflict"):
+            conflicts.append(
+                f"**Indication** — shown: DrugBank · alternate ChEMBL: {row.get('indication_class_chembl', '—')}"
+            )
+        if row.get("mw_conflict"):
+            conflicts.append(
+                f"**Molecular weight** — ChEMBL: {row.get('molecular_weight', '—')} Da · "
+                f"DrugBank: {row.get('molecular_weight_db', '—')} Da"
+            )
+        if conflicts:
+            st.markdown("**⚠️ Source conflicts**")
+            for note in conflicts:
+                st.markdown(note)
+
+        pk_fields = [
+            "absorption",
+            "half_life",
+            "protein_binding",
+            "metabolism",
+            "route_of_elimination",
+            "volume_of_distribution",
+            "clearance",
+            "toxicity",
+        ]
+        pk_data = {f: row.get(f) for f in pk_fields if f in row.index and pd.notna(row.get(f))}
+        if pk_data:
+            st.markdown("**Pharmacokinetics (DrugBank)**")
+            st.json(pk_data)
 
 
 def build_scatter(df: pd.DataFrame, ideal: dict[str, float]) -> go.Figure:
@@ -832,6 +980,7 @@ def main() -> None:
                 use_container_width=True,
                 height=480,
             )
+        render_drug_detail_panel(filtered)
 
     with col_chart:
         st.subheader("logP vs molecular weight")
