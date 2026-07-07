@@ -278,7 +278,7 @@ def apply_filters(
 ) -> pd.DataFrame:
     mask = pd.Series(True, index=df.index)
     pubchem_cols = set(PUBCHEM_COLUMNS)
-    sparse_clinical = {"max_dose_mg"}
+    sparse_optional = {"max_dose_mg", "pka_predicted", "logD_pH6"}
     defaults = default_bounds or bounds
     for col, (lo, hi) in bounds.items():
         if col not in df.columns:
@@ -286,7 +286,7 @@ def apply_filters(
         in_range = df[col].between(lo, hi)
         def_lo, def_hi = defaults.get(col, (lo, hi))
         narrowed = lo > def_lo or hi < def_hi
-        if col in pubchem_cols or col in sparse_clinical:
+        if col in pubchem_cols or col in sparse_optional:
             if narrowed:
                 mask &= df[col].notna() & in_range
             else:
