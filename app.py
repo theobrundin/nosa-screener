@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -239,27 +240,35 @@ def composite_score(
 ) -> pd.Series:
     score_cols = [c for c in ideal if c in df.columns and c != "max_dose_mg"]
     if not score_cols:
-        return pd.Series(0.0, index=df.index)
-    scores = []
-    for col in score_cols:
-        lo, hi = ranges[col]
-        scores.append(property_score(df[col], ideal[col], hi - lo))
+        total = pd.Series(0.0, index=df.index)
+    else:
+        scores = []
+        for col in score_cols:
+            lo, hi = ranges[col]
+            scores.append(property_score(df[col], ideal[col], hi - lo))
 
-    if "max_dose_mg" in df.columns:
-        dose_score = df["max_dose_mg"].map(
-            lambda dose: 100.0
-            if pd.notna(dose) and dose <= 100
-            else 0.0
-            if pd.notna(dose)
-            else 50.0
-        )
-        scores.append(dose_score)
+        if "max_dose_mg" in df.columns:
+            dose_score = df["max_dose_mg"].map(
+                lambda dose: 100.0
+                if pd.notna(dose) and dose <= 100
+                else 0.0
+                if pd.notna(dose)
+                else 50.0
+            )
+            scores.append(dose_score)
 
-    total = sum(scores) / len(scores)
-    if "max_dose_mg" in df.columns:
-        completeness_bonus = df["max_dose_mg"].notna().astype(float) * 3.0
-        return (total + completeness_bonus).clip(upper=100.0)
-    return total
+        total = sum(scores) / len(scores)
+        if "max_dose_mg" in df.columns:
+            completeness_bonus = df["max_dose_mg"].notna().astype(float) * 3.0
+            total = total + completeness_bonus
+
+    if "cns_target" in df.columns:
+        total = total + df["cns_target"].fillna(False).astype(float) * 5.0
+    if "nasal_cyp_risk" in df.columns:
+        total = total - df["nasal_cyp_risk"].fillna(False).astype(float) * 3.0
+    if "pgp_substrate" in df.columns:
+        total = total - df["pgp_substrate"].fillna(False).astype(float) * 2.0
+    return total.clip(upper=100.0)
 
 
 def apply_filters(
@@ -383,6 +392,50 @@ def render_metadata_filters(df: pd.DataFrame) -> tuple[set[int], bool, bool]:
     return hide_phases, hide_with_patent, hide_without_patent
 
 
+def has_drugbank_annotations(df: pd.DataFrame) -> bool:
+    return "cns_target" in df.columns and "primary_target" in df.columns
+
+
+def render_drugbank_filters(df: pd.DataFrame) -> tuple[bool, bool, bool]:
+    if not has_drugbank_annotations(df):
+        return False, False, False
+
+    st.subheader("DrugBank ADME filters")
+    cns_count = int(df["cns_target"].fillna(False).astype(bool).sum())
+    cyp_count = int(df["nasal_cyp_risk"].fillna(False).astype(bool).sum())
+    pgp_count = int(df["pgp_substrate"].fillna(False).astype(bool).sum())
+
+    cns_only = st.checkbox(
+        f"Show only CNS-active drugs ({cns_count:,})",
+        key="filter_cns_only",
+    )
+    hide_nasal_cyp = st.checkbox(
+        f"Hide drugs at risk of nasal CYP metabolism ({cyp_count:,})",
+        key="filter_hide_nasal_cyp",
+    )
+    hide_pgp = st.checkbox(
+        f"Hide P-gp efflux substrates ({pgp_count:,})",
+        key="filter_hide_pgp",
+    )
+    return cns_only, hide_nasal_cyp, hide_pgp
+
+
+def apply_drugbank_filters(
+    df: pd.DataFrame,
+    cns_only: bool,
+    hide_nasal_cyp: bool,
+    hide_pgp: bool,
+) -> pd.DataFrame:
+    mask = pd.Series(True, index=df.index)
+    if cns_only and "cns_target" in df.columns:
+        mask &= df["cns_target"].fillna(False).astype(bool)
+    if hide_nasal_cyp and "nasal_cyp_risk" in df.columns:
+        mask &= ~df["nasal_cyp_risk"].fillna(False).astype(bool)
+    if hide_pgp and "pgp_substrate" in df.columns:
+        mask &= ~df["pgp_substrate"].fillna(False).astype(bool)
+    return df.loc[mask].copy()
+
+
 def parse_field_sources(value: Any) -> dict[str, str]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return {}
@@ -451,6 +504,9 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "chembl_id",
         "chembl_max_phase",
         "composite_score",
+        "cns_target",
+        "primary_target",
+        "nasal_cyp_risk",
         "molecular_weight",
         "logP",
         "PSA",
@@ -490,6 +546,14 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         shown["dose_feasible_nosa"] = shown["dose_feasible_nosa"].map(
             lambda v: "✓" if v is True else "✗" if v is False else "?"
         )
+    if "cns_target" in shown.columns:
+        shown["cns_target"] = shown["cns_target"].map(
+            lambda v: "🧠" if v is True else ""
+        )
+    if "nasal_cyp_risk" in shown.columns:
+        shown["nasal_cyp_risk"] = shown["nasal_cyp_risk"].map(
+            lambda v: "⚠️" if v is True else ""
+        )
 
     for idx, row in df.iterrows():
         pos = df.index.get_loc(idx)
@@ -528,6 +592,12 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
                 conflict=bool(row.get("indication_class_conflict")),
                 alt_value=row.get("indication_class_chembl"),
             )
+        if "primary_target" in shown.columns and pd.notna(row.get("primary_target")):
+            pt = str(row["primary_target"])
+            if len(pt) > 50:
+                pt = pt[:47] + "…"
+            shown.at[idx, "primary_target"] = pt
+
         for col in ["pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg"]:
             if col in shown.columns and pd.notna(row.get(col)):
                 shown.at[idx, col] = format_value_with_badge(row[col], col, fs, precision=2)
@@ -622,6 +692,33 @@ def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
             st.markdown("**Dose data**")
             for line in dose_lines:
                 st.markdown(line)
+
+        if pd.notna(row.get("target_names")):
+            st.markdown("**Targets (DrugBank)**")
+            st.markdown(str(row["target_names"]).replace("|", " · "))
+        if pd.notna(row.get("metabolizing_enzymes")) or pd.notna(row.get("cyp_enzymes")):
+            st.markdown("**Metabolizing enzymes**")
+            enzymes = str(row.get("metabolizing_enzymes") or "")
+            if pd.notna(row.get("cyp_enzymes")):
+                cyp_set = set(_split_pipe_values(row.get("cyp_enzymes")))
+                parts = []
+                for part in _split_pipe_values(enzymes):
+                    if part in cyp_set or "CYP" in part.upper() or "Cytochrome" in part:
+                        parts.append(f"**{part}**")
+                    else:
+                        parts.append(part)
+                st.markdown(" · ".join(parts) if parts else enzymes)
+            else:
+                st.markdown(enzymes.replace("|", " · "))
+        if pd.notna(row.get("transporters")):
+            st.markdown("**Transporters**")
+            trans_parts = []
+            for part in _split_pipe_values(row.get("transporters")):
+                if re.search(r"P-glycoprotein|P-gp|ABCB1|MDR1", part, re.IGNORECASE):
+                    trans_parts.append(f"**{part}** (P-gp)")
+                else:
+                    trans_parts.append(part)
+            st.markdown(" · ".join(trans_parts))
 
         pk_fields = [
             "absorption",
@@ -981,6 +1078,9 @@ def main() -> None:
         hide_phases, hide_with_patent, hide_without_patent = render_metadata_filters(df)
 
         st.divider()
+        cns_only, hide_nasal_cyp, hide_pgp = render_drugbank_filters(df)
+
+        st.divider()
         st.markdown("**Memantine benchmark**")
         st.markdown(benchmark_text(ideal, n_criteria))
 
@@ -991,6 +1091,7 @@ def main() -> None:
     filtered = apply_metadata_filters(
         filtered, hide_phases, hide_with_patent, hide_without_patent
     )
+    filtered = apply_drugbank_filters(filtered, cns_only, hide_nasal_cyp, hide_pgp)
     filtered["composite_score"] = composite_score(filtered, ideal, slider_ranges)
     filtered = filtered.sort_values("composite_score", ascending=False)
 

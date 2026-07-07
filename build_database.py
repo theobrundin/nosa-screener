@@ -808,6 +808,369 @@ CHEMBL_PRIMARY_FIELDS = {
     "chembl_max_phase",
 }
 
+DRUGBANK_PROTEINS_TSV = ROOT / "kaggle-drugbank" / "proteins.tsv"
+UNIPROT_LOOKUP_CSV = ROOT / "kaggle-drugbank" / "uniprot_lookup.csv"
+
+ANNOTATION_COLUMNS = [
+    "target_names",
+    "target_genes",
+    "target_count",
+    "primary_target",
+    "cns_target",
+    "metabolizing_enzymes",
+    "cyp_enzymes",
+    "enzyme_count",
+    "nasal_cyp_risk",
+    "cyp3a4_substrate",
+    "transporters",
+    "transporter_count",
+    "pgp_substrate",
+]
+
+BE_TOKEN_RE = re.compile(r"^BE\d{4,7}$", re.IGNORECASE)
+UNIPROT_TOKEN_RE = re.compile(r"^[A-NR-Z][0-9][A-Z0-9]{4,8}$")
+
+CYP_TEXT_RE = re.compile(
+    r"Cytochrome\s+P450\s+(\d+[A-Z]?\d*)|\b(CYP\s*\d+[A-Z0-9]*)\b",
+    re.IGNORECASE,
+)
+
+NASAL_CYP_PATTERNS = (
+    r"CYP1A1",
+    r"CYP1A2",
+    r"CYP2A6",
+    r"CYP3A4",
+    r"CYP3A5",
+    r"CYP2C\d*",
+    r"CYP2D6",
+    r"Cytochrome\s+P450\s+1A1",
+    r"Cytochrome\s+P450\s+1A2",
+    r"Cytochrome\s+P450\s+2A6",
+    r"Cytochrome\s+P450\s+3A4",
+    r"Cytochrome\s+P450\s+3A5",
+    r"Cytochrome\s+P450\s+2C",
+    r"Cytochrome\s+P450\s+2D6",
+)
+NASAL_CYP_RE = re.compile("|".join(NASAL_CYP_PATTERNS), re.IGNORECASE)
+CYP3A4_RE = re.compile(r"CYP\s*3A4|Cytochrome\s+P450\s+3A4", re.IGNORECASE)
+PGP_RE = re.compile(
+    r"P-glycoprotein|P-gp|ABCB1|MDR1|Multidrug resistance protein 1",
+    re.IGNORECASE,
+)
+
+CNS_NAME_PATTERNS = (
+    r"\bnmda\b",
+    r"\bgaba\b",
+    r"gamma-aminobutyric",
+    r"dopamine",
+    r"serotonin",
+    r"adrenergic",
+    r"opioid",
+    r"cannabinoid",
+    r"acetylcholine",
+    r"muscarinic",
+    r"nicotinic",
+    r"glutamate",
+    r"histamine\s*h\s*[13]",
+    r"\b5-ht\b",
+    r"beta\s*adrenoceptor",
+    r"alpha\s*adrenoceptor",
+)
+CNS_GENE_PATTERNS = (
+    r"^GRIN\d+",
+    r"^DRD\d+",
+    r"^HTR\d+",
+    r"^GABR[A-Z]\d+",
+    r"^CHRM\d+",
+    r"^CHRN[A-Z]\d+",
+    r"^OPRM?\d+",
+    r"^OPRK\d+",
+    r"^OPRD\d+",
+    r"^CNR\d+",
+    r"^HRH[13]$",
+    r"^ADRA\d+",
+    r"^ADRB\d+",
+    r"^SLC6A\d+",
+)
+CNS_NAME_RE = re.compile("|".join(CNS_NAME_PATTERNS), re.IGNORECASE)
+CNS_GENE_RE = re.compile("|".join(CNS_GENE_PATTERNS), re.IGNORECASE)
+
+
+def parse_db_tokens(value: Any) -> list[str]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    return [tok for tok in str(value).split() if tok.strip()]
+
+
+def print_drugbank_field_samples(drugbank: pd.DataFrame) -> None:
+    print("\n── DrugBank field format samples ─────────────────")
+    for col in ("targets", "enzymes", "transporters"):
+        if col not in drugbank.columns:
+            print(f"  {col}: column not found")
+            continue
+        samples = drugbank[col].dropna().astype(str)
+        samples = samples[samples.str.strip() != ""]
+        print(f"  {col} ({len(samples):,} non-null) — space-delimited BE / UniProt IDs:")
+        for idx, sample in enumerate(samples.head(3)):
+            label = drugbank.loc[samples.index[idx], "name"] if "name" in drugbank.columns else f"row {idx}"
+            text = sample if len(sample) <= 120 else sample[:117] + "..."
+            print(f"    [{label}] {text}")
+
+
+def load_uniprot_lookup() -> dict[str, dict[str, str]]:
+    if not UNIPROT_LOOKUP_CSV.exists():
+        print(f"  UniProt lookup not found: {UNIPROT_LOOKUP_CSV}")
+        return {}
+    lookup_df = pd.read_csv(UNIPROT_LOOKUP_CSV)
+    lookup: dict[str, dict[str, str]] = {}
+    for _, row in lookup_df.iterrows():
+        uid = str(row["uniprot_id"]).strip()
+        lookup[uid] = {
+            "protein_name": str(row.get("protein_name") or "").strip(),
+            "gene_symbol": str(row.get("gene_symbol") or "").strip(),
+        }
+    print(f"  UniProt lookup entries: {len(lookup):,}")
+    return lookup
+
+
+def load_drugbank_proteins() -> pd.DataFrame:
+    if not DRUGBANK_PROTEINS_TSV.exists():
+        print(f"  DrugBank proteins.tsv not found: {DRUGBANK_PROTEINS_TSV}")
+        return pd.DataFrame(columns=["drugbank_id", "category", "uniprot_id", "entrez_gene_id"])
+    proteins = pd.read_csv(DRUGBANK_PROTEINS_TSV, sep="\t")
+    proteins["drugbank_id"] = proteins["drugbank_id"].astype(str)
+    print(f"  DrugBank protein bindings: {len(proteins):,}")
+    return proteins
+
+
+def resolve_uniprot_name(uniprot_id: str, lookup: dict[str, dict[str, str]]) -> str:
+    info = lookup.get(uniprot_id, {})
+    return info.get("protein_name") or uniprot_id
+
+
+def resolve_uniprot_gene(uniprot_id: str, lookup: dict[str, dict[str, str]]) -> str:
+    info = lookup.get(uniprot_id, {})
+    return info.get("gene_symbol") or ""
+
+
+def proteins_for_drug(
+    drugbank_id: str,
+    category: str,
+    proteins: pd.DataFrame,
+    lookup: dict[str, dict[str, str]],
+) -> tuple[list[str], list[str]]:
+    if proteins.empty or not drugbank_id:
+        return [], []
+    rows = proteins[(proteins["drugbank_id"] == drugbank_id) & (proteins["category"] == category)]
+    names: list[str] = []
+    genes: list[str] = []
+    for _, row in rows.iterrows():
+        uid = str(row.get("uniprot_id") or "").strip()
+        if not uid:
+            continue
+        names.append(resolve_uniprot_name(uid, lookup))
+        gene = resolve_uniprot_gene(uid, lookup)
+        if gene:
+            genes.append(gene)
+    return names, genes
+
+
+def is_valid_cyp_label(label: str) -> bool:
+    return bool(re.match(r"^CYP\d+[A-Z]", label.upper()))
+
+
+def extract_cyp_mentions(*texts: str | None) -> list[str]:
+    found: list[str] = []
+    for text in texts:
+        if not text or (isinstance(text, float) and pd.isna(text)):
+            continue
+        for match in CYP_TEXT_RE.finditer(str(text)):
+            label = (match.group(1) or match.group(2) or "").strip()
+            if not label or label == "450":
+                continue
+            label = re.sub(r"\s+", "", label.upper())
+            if not label.startswith("CYP"):
+                label = f"CYP{label}"
+            if is_valid_cyp_label(label):
+                found.append(label)
+    return found
+
+
+def cyp_labels_from_names(names: list[str]) -> list[str]:
+    labels: list[str] = []
+    for name in names:
+        match = re.search(r"Cytochrome\s+P450\s+(\d+[A-Z]\d*)", name, re.IGNORECASE)
+        if match:
+            candidate = f"CYP{match.group(1).upper()}"
+            if is_valid_cyp_label(candidate):
+                labels.append(candidate)
+            continue
+        match = re.search(r"\b(CYP\d+[A-Z0-9]*)\b", name, re.IGNORECASE)
+        if match:
+            candidate = re.sub(r"\s+", "", match.group(1).upper())
+            if is_valid_cyp_label(candidate):
+                labels.append(candidate)
+    return labels
+
+
+def is_cns_associated(*text_blobs: str | None) -> bool:
+    for blob in text_blobs:
+        if not blob or (isinstance(blob, float) and pd.isna(blob)):
+            continue
+        text = str(blob)
+        if CNS_NAME_RE.search(text):
+            return True
+        for gene in re.split(r"[|,\s]+", text):
+            gene = gene.strip()
+            if gene and CNS_GENE_RE.search(gene):
+                return True
+    return False
+
+
+def has_nasal_cyp_risk(*text_blobs: str | None) -> bool:
+    for blob in text_blobs:
+        if not blob or (isinstance(blob, float) and pd.isna(blob)):
+            continue
+        if NASAL_CYP_RE.search(str(blob)):
+            return True
+    return False
+
+
+def is_cyp3a4_substrate(*text_blobs: str | None) -> bool:
+    for blob in text_blobs:
+        if not blob or (isinstance(blob, float) and pd.isna(blob)):
+            continue
+        if CYP3A4_RE.search(str(blob)):
+            return True
+    return False
+
+
+def is_pgp_substrate(*text_blobs: str | None) -> bool:
+    for blob in text_blobs:
+        if not blob or (isinstance(blob, float) and pd.isna(blob)):
+            continue
+        if PGP_RE.search(str(blob)):
+            return True
+    return False
+
+
+def extract_drugbank_annotations(
+    db_row: pd.Series,
+    proteins: pd.DataFrame,
+    lookup: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    drugbank_id = _clean_db_value(db_row.get("drugbank-id"))
+    result: dict[str, Any] = {col: None for col in ANNOTATION_COLUMNS}
+    for flag_col in ("cns_target", "nasal_cyp_risk", "cyp3a4_substrate", "pgp_substrate"):
+        result[flag_col] = False
+
+    target_tokens = parse_db_tokens(db_row.get("targets"))
+    enzyme_tokens = parse_db_tokens(db_row.get("enzymes"))
+    transporter_tokens = parse_db_tokens(db_row.get("transporters"))
+
+    if target_tokens:
+        result["target_count"] = len(target_tokens)
+        names, genes = proteins_for_drug(str(drugbank_id), "target", proteins, lookup)
+        if not names:
+            names = [tok for tok in target_tokens if not BE_TOKEN_RE.match(tok)]
+        result["target_names"] = pipe_join_unique(names)
+        result["target_genes"] = pipe_join_unique(genes)
+        result["primary_target"] = names[0] if names else None
+
+    enzyme_names: list[str] = []
+    if enzyme_tokens:
+        result["enzyme_count"] = len(enzyme_tokens)
+        prot_names, _ = proteins_for_drug(str(drugbank_id), "enzyme", proteins, lookup)
+        enzyme_names.extend(prot_names)
+        for tok in enzyme_tokens:
+            if UNIPROT_TOKEN_RE.match(tok):
+                enzyme_names.append(resolve_uniprot_name(tok, lookup))
+
+    metabolism = _clean_db_value(db_row.get("metabolism"))
+    cyp_from_text = extract_cyp_mentions(metabolism, db_row.get("mechanism-of-action"))
+    enzyme_names.extend(cyp_from_text)
+    if enzyme_names or enzyme_tokens or metabolism:
+        result["metabolizing_enzymes"] = pipe_join_unique(enzyme_names)
+        cyp_labels = cyp_labels_from_names(enzyme_names)
+        cyp_labels.extend(extract_cyp_mentions(metabolism, db_row.get("mechanism-of-action")))
+        result["cyp_enzymes"] = pipe_join_unique(cyp_labels)
+        if not result["enzyme_count"] and (enzyme_names or cyp_from_text):
+            result["enzyme_count"] = len(enzyme_tokens) or len(enzyme_names)
+
+    if transporter_tokens:
+        result["transporter_count"] = len(transporter_tokens)
+        t_names, _ = proteins_for_drug(str(drugbank_id), "transporter", proteins, lookup)
+        if not t_names:
+            t_names = [tok for tok in transporter_tokens if not BE_TOKEN_RE.match(tok)]
+        result["transporters"] = pipe_join_unique(t_names)
+
+    cns_text = [
+        result.get("target_names"),
+        result.get("target_genes"),
+        result.get("primary_target"),
+        db_row.get("mechanism-of-action"),
+        db_row.get("pharmacodynamics"),
+    ]
+    result["cns_target"] = is_cns_associated(*cns_text)
+
+    cyp_text = [result.get("metabolizing_enzymes"), result.get("cyp_enzymes"), metabolism]
+    result["nasal_cyp_risk"] = has_nasal_cyp_risk(*cyp_text)
+    result["cyp3a4_substrate"] = is_cyp3a4_substrate(*cyp_text)
+
+    trans_text = [result.get("transporters")]
+    result["pgp_substrate"] = is_pgp_substrate(*trans_text)
+
+    return result
+
+
+def merge_drugbank_annotations(
+    df: pd.DataFrame,
+    drugbank: pd.DataFrame,
+    proteins: pd.DataFrame,
+    lookup: dict[str, dict[str, str]],
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    stats = {
+        "target_data": 0,
+        "cns_active": 0,
+        "enzyme_data": 0,
+        "nasal_cyp_risk": 0,
+        "transporter_data": 0,
+        "pgp_substrate": 0,
+    }
+    df = df.copy()
+    for col in ANNOTATION_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    if drugbank.empty:
+        return df, stats
+
+    db_by_key = drugbank.set_index("name_key", drop=False)
+
+    for idx, row in df.iterrows():
+        if row["name_key"] not in db_by_key.index:
+            continue
+        db_row = db_by_key.loc[row["name_key"]]
+        if isinstance(db_row, pd.DataFrame):
+            db_row = db_row.iloc[0]
+        ann = extract_drugbank_annotations(db_row, proteins, lookup)
+        for col, val in ann.items():
+            df.at[idx, col] = val
+        if ann.get("target_count"):
+            stats["target_data"] += 1
+        if ann.get("cns_target"):
+            stats["cns_active"] += 1
+        if ann.get("metabolizing_enzymes") or ann.get("cyp_enzymes"):
+            stats["enzyme_data"] += 1
+        if ann.get("nasal_cyp_risk"):
+            stats["nasal_cyp_risk"] += 1
+        if ann.get("transporters"):
+            stats["transporter_data"] += 1
+        if ann.get("pgp_substrate"):
+            stats["pgp_substrate"] += 1
+
+    return df, stats
+
 
 def normalize_text(value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -844,6 +1207,7 @@ def load_drugbank() -> pd.DataFrame:
     db = db.drop_duplicates(subset="name_key", keep="first")
     db = db.drop(columns=["_richness"])
     print(f"  DrugBank records indexed: {len(db):,}")
+    print_drugbank_field_samples(db)
     return db
 
 
@@ -978,6 +1342,13 @@ def print_drugbank_summary(stats: dict[str, int]) -> None:
     print(f"  MW conflicts (>1 Da difference)  {stats.get('mw_conflicts', 0):>7,}")
     print(f"  Physical state (DrugBank only)   {stats.get('physical_state_populated', 0):>7,}")
     print(f"  PK fields populated (DrugBank)   {stats.get('pk_populated', 0):>7,}")
+    print("\n── DrugBank targets/enzymes/transporters ─────────")
+    print(f"  Target data extracted:         {stats.get('target_data', 0):>7,}")
+    print(f"  CNS-active drugs flagged:      {stats.get('cns_active', 0):>7,}")
+    print(f"  Enzyme/CYP data:               {stats.get('enzyme_data', 0):>7,}")
+    print(f"  Nasal CYP risk flagged:        {stats.get('nasal_cyp_risk', 0):>7,}")
+    print(f"  Transporter data:              {stats.get('transporter_data', 0):>7,}")
+    print(f"  P-gp substrates flagged:       {stats.get('pgp_substrate', 0):>7,}")
 
 
 def print_build_summary(stats: dict[str, int]) -> None:
@@ -1082,8 +1453,12 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     print(f"  SMILES filled from DrugCentral: {stats['smiles_filled']:,}")
 
     drugbank = load_drugbank()
+    proteins = load_drugbank_proteins()
+    uniprot_lookup = load_uniprot_lookup()
     merged, drugbank_stats = merge_drugbank_priorities(merged, drugbank)
+    merged, annotation_stats = merge_drugbank_annotations(merged, drugbank, proteins, uniprot_lookup)
     stats.update(drugbank_stats)
+    stats.update(annotation_stats)
 
     print("Calculating predicted pKa and logD from SMILES...")
     merged = add_pka_logd_predictions(merged)
@@ -1109,6 +1484,19 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "target_name",
         "target_chembl_id",
         "action_type",
+        "target_names",
+        "target_genes",
+        "target_count",
+        "primary_target",
+        "cns_target",
+        "metabolizing_enzymes",
+        "cyp_enzymes",
+        "enzyme_count",
+        "nasal_cyp_risk",
+        "cyp3a4_substrate",
+        "transporters",
+        "transporter_count",
+        "pgp_substrate",
         "synonyms",
         "max_synonym_count",
         "molecular_weight",
