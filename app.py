@@ -52,7 +52,7 @@ PUBCHEM_SLIDER_RANGES = {
 CLINICAL_SLIDER_RANGES = {
     "pka_predicted": (-5, 14),
     "logD_pH6": (-5, 8),
-    "max_clinical_dose_mg": (0, 500),
+    "max_dose_mg": (0, 500),
 }
 
 PUBCHEM_COLUMNS = list(PUBCHEM_SLIDER_RANGES.keys())
@@ -68,7 +68,7 @@ FILTER_LABELS = {
     "melting_point_c": "Melting point (°C)",
     "pka_predicted": "pKa (predicted) — Stanko filter: 3–10",
     "logD_pH6": "logD at nasal pH 6.0",
-    "max_clinical_dose_mg": "Max clinical dose (mg) — NOSA limit: 100 mg",
+    "max_dose_mg": "Max clinical dose (mg) — source: ChEMBL or ClinicalTrials.gov",
 }
 
 FILTER_STEPS = {
@@ -81,13 +81,13 @@ FILTER_STEPS = {
     "melting_point_c": 1.0,
     "pka_predicted": 0.1,
     "logD_pH6": 0.1,
-    "max_clinical_dose_mg": 1.0,
+    "max_dose_mg": 1.0,
 }
 
 CLINICAL_DEFAULTS = {
     "pka_predicted": (3.0, 10.0),
     "logD_pH6": (1.0, 4.0),
-    "max_clinical_dose_mg": (0.0, 100.0),
+    "max_dose_mg": (0.0, 100.0),
 }
 
 
@@ -201,6 +201,11 @@ def load_database(path_str: str) -> pd.DataFrame:
             else False if v is False or str(v).lower() == "false"
             else None
         )
+    if "max_dose_mg" not in df.columns and "max_clinical_dose_mg" in df.columns:
+        df["max_dose_mg"] = df["max_clinical_dose_mg"]
+        df["max_dose_source"] = df["max_clinical_dose_mg"].apply(
+            lambda v: "chembl" if pd.notna(v) else None
+        )
     return df
 
 
@@ -215,7 +220,7 @@ def active_score_config(df: pd.DataFrame) -> tuple[dict[str, float], dict[str, t
             {
                 "pka_predicted": 6.5,
                 "logD_pH6": 2.5,
-                "max_clinical_dose_mg": 50.0,
+                "max_dose_mg": 50.0,
             }
         )
         ranges.update(CLINICAL_SLIDER_RANGES)
@@ -232,7 +237,7 @@ def composite_score(
     ideal: dict[str, float],
     ranges: dict[str, tuple[float, float]],
 ) -> pd.Series:
-    score_cols = [c for c in ideal if c in df.columns and c != "max_clinical_dose_mg"]
+    score_cols = [c for c in ideal if c in df.columns and c != "max_dose_mg"]
     if not score_cols:
         return pd.Series(0.0, index=df.index)
     scores = []
@@ -240,8 +245,8 @@ def composite_score(
         lo, hi = ranges[col]
         scores.append(property_score(df[col], ideal[col], hi - lo))
 
-    if "max_clinical_dose_mg" in df.columns:
-        dose_score = df["max_clinical_dose_mg"].map(
+    if "max_dose_mg" in df.columns:
+        dose_score = df["max_dose_mg"].map(
             lambda dose: 100.0
             if pd.notna(dose) and dose <= 100
             else 0.0
@@ -251,8 +256,8 @@ def composite_score(
         scores.append(dose_score)
 
     total = sum(scores) / len(scores)
-    if "max_clinical_dose_mg" in df.columns:
-        completeness_bonus = df["max_clinical_dose_mg"].notna().astype(float) * 3.0
+    if "max_dose_mg" in df.columns:
+        completeness_bonus = df["max_dose_mg"].notna().astype(float) * 3.0
         return (total + completeness_bonus).clip(upper=100.0)
     return total
 
@@ -264,7 +269,7 @@ def apply_filters(
 ) -> pd.DataFrame:
     mask = pd.Series(True, index=df.index)
     pubchem_cols = set(PUBCHEM_COLUMNS)
-    sparse_clinical = {"max_clinical_dose_mg"}
+    sparse_clinical = {"max_dose_mg"}
     defaults = default_bounds or bounds
     for col, (lo, hi) in bounds.items():
         if col not in df.columns:
@@ -394,9 +399,19 @@ def source_badge(field: str, field_sources: dict[str, str]) -> str:
     source = field_sources.get(field, "")
     if source == "drugbank":
         return "DB"
+    if source == "clinicaltrials":
+        return "CT"
     if source == "chembl":
         return "C"
     return ""
+
+
+def dose_field_sources(row: pd.Series) -> dict[str, str]:
+    sources = parse_field_sources(row.get("field_sources"))
+    source = row.get("max_dose_source")
+    if pd.notna(source) and str(source).strip():
+        sources["max_dose_mg"] = str(source)
+    return sources
 
 
 def format_value_with_badge(
@@ -446,7 +461,7 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "pka_predicted",
         "logD_pH6",
         "logD_pH74",
-        "max_clinical_dose_mg",
+        "max_dose_mg",
         "dose_feasible_nosa",
         "atc_code",
         "mesh_heading",
@@ -479,6 +494,7 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     for idx, row in df.iterrows():
         pos = df.index.get_loc(idx)
         fs = field_sources_list[pos] if pos < len(field_sources_list) else {}
+        fs = {**fs, **{k: v for k, v in dose_field_sources(row).items() if k not in fs or k == "max_dose_mg"}}
         if "molecular_weight" in shown.columns and pd.notna(row.get("molecular_weight")):
             shown.at[idx, "molecular_weight"] = format_value_with_badge(
                 round(float(row["molecular_weight"]), 2),
@@ -512,7 +528,7 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
                 conflict=bool(row.get("indication_class_conflict")),
                 alt_value=row.get("indication_class_chembl"),
             )
-        for col in ["pka_predicted", "logD_pH6", "logD_pH74", "max_clinical_dose_mg"]:
+        for col in ["pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg"]:
             if col in shown.columns and pd.notna(row.get(col)):
                 shown.at[idx, col] = format_value_with_badge(row[col], col, fs, precision=2)
         for col in ["physical_state", "half_life"]:
@@ -588,6 +604,24 @@ def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
             st.markdown("**⚠️ Source conflicts**")
             for note in conflicts:
                 st.markdown(note)
+
+        dose_lines: list[str] = []
+        if pd.notna(row.get("max_dose_mg")):
+            src = row.get("max_dose_source", "—")
+            src_label = "ChEMBL" if src == "chembl" else "ClinicalTrials.gov" if src == "clinicaltrials" else str(src)
+            dose_lines.append(f"**Unified max dose:** {row['max_dose_mg']:.1f} mg ({src_label})")
+        if pd.notna(row.get("max_clinical_dose_mg")):
+            dose_lines.append(f"ChEMBL max dose: {row['max_clinical_dose_mg']:.1f} mg")
+        if pd.notna(row.get("ct_max_dose_mg")):
+            dose_lines.append(f"ClinicalTrials.gov max dose: {row['ct_max_dose_mg']:.1f} mg")
+        if pd.notna(row.get("ct_n_studies")):
+            dose_lines.append(f"ClinicalTrials.gov studies: {int(row['ct_n_studies'])}")
+        if pd.notna(row.get("ct_max_dose_raw")):
+            dose_lines.append(f"CT dose snippet: _{row['ct_max_dose_raw']}_")
+        if dose_lines:
+            st.markdown("**Dose data**")
+            for line in dose_lines:
+                st.markdown(line)
 
         pk_fields = [
             "absorption",
@@ -884,8 +918,8 @@ def benchmark_text(ideal: dict[str, float], n_criteria: int) -> str:
         parts.append(f"pKa {ideal['pka_predicted']:.1f}")
     if "logD_pH6" in ideal:
         parts.append(f"logD₆ {ideal['logD_pH6']:.1f}")
-    if "max_clinical_dose_mg" in ideal:
-        parts.append(f"Dose {ideal['max_clinical_dose_mg']:.0f} mg")
+    if "max_dose_mg" in ideal:
+        parts.append(f"Dose {ideal['max_dose_mg']:.0f} mg")
     return " · ".join(parts) + f" ({n_criteria} criteria)"
 
 
@@ -906,7 +940,7 @@ def main() -> None:
     for col, bounds in CLINICAL_DEFAULTS.items():
         if col in slider_ranges:
             default_bounds[col] = bounds
-    n_criteria = len(ideal) + (1 if "max_clinical_dose_mg" in df.columns else 0)
+    n_criteria = len(ideal) + (1 if "max_dose_mg" in df.columns else 0)
 
     st.title("NOSA Drug Screener")
     st.caption(
