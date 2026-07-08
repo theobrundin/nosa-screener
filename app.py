@@ -67,7 +67,7 @@ FILTER_LABELS = {
     "rotatable_bonds": "Rotatable bonds",
     "vapor_pressure_mmhg": "Vapor pressure (mmHg)",
     "melting_point_c": "Melting point (°C)",
-    "pka_predicted": "pKa (predicted) — Stanko filter: 3–10",
+    "pka_predicted": "pKa (predicted)",
     "logD_pH6": "logD at nasal pH 6.0",
     "max_dose_mg": "Max clinical dose (mg) — source: ChEMBL or ClinicalTrials.gov",
 }
@@ -90,6 +90,31 @@ CLINICAL_DEFAULTS = {
     "logD_pH6": (1.0, 4.0),
     "max_dose_mg": (0.0, 100.0),
 }
+
+ATC_LEVEL1_NAMES = {
+    "A": "Alimentary / metabolism",
+    "B": "Blood / hematology",
+    "C": "Cardiovascular",
+    "D": "Dermatologicals",
+    "G": "Genito-urinary / hormones",
+    "H": "Systemic hormonal",
+    "J": "Anti-infectives",
+    "L": "Antineoplastic / immunomod",
+    "M": "Musculoskeletal",
+    "N": "Nervous system",
+    "P": "Antiparasitic / insecticides",
+    "R": "Respiratory",
+    "S": "Sensory organs",
+    "V": "Various",
+}
+
+ROUTE_LABELS = {
+    "oral": "Oral",
+    "parenteral": "Parenteral",
+    "topical": "Topical",
+}
+
+DISPLAY_ROW_LIMIT = 500
 
 
 def database_path() -> Path:
@@ -177,6 +202,20 @@ def inject_styles() -> None:
             color: {DISABLED} !important;
             font-size: 0.85rem;
         }}
+        [data-testid="stPills"] button {{
+            border-radius: 8px !important;
+            font-weight: 600 !important;
+        }}
+        [data-testid="stPills"] [aria-pressed="true"] {{
+            background-color: {ACCENT} !important;
+            color: {PRIMARY} !important;
+            border-color: {ACCENT} !important;
+        }}
+        [data-testid="stPills"] [aria-pressed="false"] {{
+            background-color: {SURFACE} !important;
+            color: {TEXT} !important;
+            border-color: {DISABLED} !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -187,9 +226,15 @@ def has_clinical_data(df: pd.DataFrame) -> bool:
     return "pka_predicted" in df.columns and "logD_pH6" in df.columns
 
 
+def _split_pipe_values(value: Any) -> list[str]:
+    if pd.isna(value) or not str(value).strip():
+        return []
+    return [part.strip() for part in str(value).split("|") if part.strip()]
+
+
 @st.cache_data
 def load_database(path_str: str) -> pd.DataFrame:
-    df = pd.read_csv(path_str)
+    df = pd.read_csv(path_str, low_memory=False)
     numeric_cols = list(BASE_IDEAL.keys()) + PUBCHEM_COLUMNS + CLINICAL_COLUMNS
     for col in numeric_cols:
         if col in df.columns:
@@ -206,6 +251,20 @@ def load_database(path_str: str) -> pd.DataFrame:
         df["max_dose_mg"] = df["max_clinical_dose_mg"]
         df["max_dose_source"] = df["max_clinical_dose_mg"].apply(
             lambda v: "chembl" if pd.notna(v) else None
+        )
+    if "cns_target" in df.columns:
+        df["cns_target"] = df["cns_target"].astype("boolean").fillna(False).astype(bool)
+    if "nasal_cyp_risk" in df.columns:
+        df["nasal_cyp_risk"] = df["nasal_cyp_risk"].astype("boolean").fillna(False).astype(bool)
+    if "pgp_substrate" in df.columns:
+        df["pgp_substrate"] = df["pgp_substrate"].astype("boolean").fillna(False).astype(bool)
+    if "route_of_administration" in df.columns:
+        df["_route_tokens"] = df["route_of_administration"].map(
+            lambda v: frozenset(_split_pipe_values(v))
+        )
+    if "atc_level1" in df.columns:
+        df["_atc_tokens"] = df["atc_level1"].map(
+            lambda v: frozenset(_split_pipe_values(v))
         )
     return df
 
@@ -293,13 +352,7 @@ def apply_filters(
                 mask &= df[col].isna() | in_range
         else:
             mask &= df[col].notna() & in_range
-    return df.loc[mask].copy()
-
-
-def _split_pipe_values(value: Any) -> list[str]:
-    if pd.isna(value) or not str(value).strip():
-        return []
-    return [part.strip() for part in str(value).split("|") if part.strip()]
+    return df.loc[mask]
 
 
 def apply_categorical_filters(
@@ -312,28 +365,28 @@ def apply_categorical_filters(
     mask = pd.Series(True, index=df.index)
 
     if routes is not None and len(routes) < len(all_routes) and "route_of_administration" in df.columns:
-        selected = set(routes)
-
-        def route_match(value: Any) -> bool:
-            parts = _split_pipe_values(value)
-            return bool(parts) and any(part in selected for part in parts)
-
-        mask &= df["route_of_administration"].map(route_match)
+        selected = frozenset(routes)
+        if "_route_tokens" in df.columns:
+            mask &= df["_route_tokens"].map(lambda tokens: bool(tokens & selected))
+        else:
+            mask &= df["route_of_administration"].map(
+                lambda v: bool(set(_split_pipe_values(v)) & selected)
+            )
 
     if (
         atc_levels is not None
         and len(atc_levels) < len(all_atc_levels)
         and "atc_level1" in df.columns
     ):
-        selected = set(atc_levels)
+        selected = frozenset(atc_levels)
+        if "_atc_tokens" in df.columns:
+            mask &= df["_atc_tokens"].map(lambda tokens: bool(tokens & selected))
+        else:
+            mask &= df["atc_level1"].map(
+                lambda v: bool(set(_split_pipe_values(v)) & selected)
+            )
 
-        def atc_match(value: Any) -> bool:
-            parts = _split_pipe_values(value)
-            return bool(parts) and any(part in selected for part in parts)
-
-        mask &= df["atc_level1"].map(atc_match)
-
-    return df.loc[mask].copy()
+    return df.loc[mask]
 
 
 def apply_metadata_filters(
@@ -356,7 +409,7 @@ def apply_metadata_filters(
         if hide_without_patent:
             mask &= has_patent
 
-    return df.loc[mask].copy()
+    return df.loc[mask]
 
 
 def phase_counts(df: pd.DataFrame) -> dict[int, int]:
@@ -433,7 +486,7 @@ def apply_drugbank_filters(
         mask &= ~df["nasal_cyp_risk"].fillna(False).astype(bool)
     if hide_pgp and "pgp_substrate" in df.columns:
         mask &= ~df["pgp_substrate"].fillna(False).astype(bool)
-    return df.loc[mask].copy()
+    return df.loc[mask]
 
 
 def parse_field_sources(value: Any) -> dict[str, str]:
@@ -491,14 +544,8 @@ def format_value_with_badge(
     return text
 
 
-def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
-    def highlight_nosa(row: pd.Series) -> list[str]:
-        if row.get("nosa_candidate"):
-            return [f"background-color: {ACCENT}; color: {PRIMARY}; font-weight: 600"] * len(
-                row
-            )
-        return [f"background-color: {SURFACE}; color: {TEXT}"] * len(row)
-
+def prepare_results_table(df: pd.DataFrame, limit: int = DISPLAY_ROW_LIMIT) -> tuple[pd.DataFrame, bool]:
+    """Build display-ready string table (capped for performance)."""
     display_cols = [
         "name",
         "chembl_id",
@@ -532,34 +579,54 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "earliest_patent_expiry",
     ]
     display_cols = [c for c in display_cols if c in df.columns]
-    shown = df[display_cols].copy()
-    shown["composite_score"] = shown["composite_score"].round(1)
+    truncated = len(df) > limit
+    work = df.head(limit).reset_index(drop=True)
 
-    field_sources_list = df["field_sources"].map(parse_field_sources) if "field_sources" in df.columns else [{}] * len(df)
-    field_sources_list = list(field_sources_list)
+    if "field_sources" in work.columns:
+        fs_series = work["field_sources"].map(parse_field_sources)
+    else:
+        fs_series = pd.Series([{}] * len(work), index=work.index)
 
-    if "chembl_max_phase" in shown.columns:
-        shown["chembl_max_phase"] = shown["chembl_max_phase"].apply(
-            lambda v: int(v) if pd.notna(v) else "—"
-        )
-    if "dose_feasible_nosa" in shown.columns:
-        shown["dose_feasible_nosa"] = shown["dose_feasible_nosa"].map(
-            lambda v: "✓" if v is True else "✗" if v is False else "?"
-        )
-    if "cns_target" in shown.columns:
-        shown["cns_target"] = shown["cns_target"].map(
-            lambda v: "🧠" if v is True else ""
-        )
-    if "nasal_cyp_risk" in shown.columns:
-        shown["nasal_cyp_risk"] = shown["nasal_cyp_risk"].map(
-            lambda v: "⚠️" if v is True else ""
-        )
+    shown = pd.DataFrame(index=work.index)
+    shown["nosa_candidate"] = work["nosa_candidate"] if "nosa_candidate" in work.columns else False
 
-    for idx, row in df.iterrows():
-        pos = df.index.get_loc(idx)
-        fs = field_sources_list[pos] if pos < len(field_sources_list) else {}
-        fs = {**fs, **{k: v for k, v in dose_field_sources(row).items() if k not in fs or k == "max_dose_mg"}}
-        if "molecular_weight" in shown.columns and pd.notna(row.get("molecular_weight")):
+    for col in display_cols:
+        if col == "nosa_candidate":
+            continue
+        if col == "composite_score":
+            shown[col] = work[col].round(1).astype(str)
+        elif col == "chembl_max_phase":
+            shown[col] = work[col].apply(lambda v: str(int(v)) if pd.notna(v) else "—")
+        elif col == "dose_feasible_nosa":
+            shown[col] = work[col].map(
+                lambda v: "✓" if v is True else "✗" if v is False else "?"
+            )
+        elif col == "cns_target":
+            shown[col] = work[col].map(lambda v: "🧠" if v is True else "")
+        elif col == "nasal_cyp_risk":
+            shown[col] = work[col].map(lambda v: "⚠️" if v is True else "")
+        elif col in ("PSA", "vapor_pressure_mmhg", "melting_point_c"):
+            shown[col] = work[col].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+        elif col == "primary_target":
+            shown[col] = work[col].apply(
+                lambda v: (str(v)[:47] + "…") if pd.notna(v) and len(str(v)) > 50 else (str(v) if pd.notna(v) else "—")
+            )
+        elif col in ("mechanism_of_action", "indication_class"):
+            shown[col] = "—"
+        elif col in ("pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg", "logP"):
+            shown[col] = "—"
+        elif col == "molecular_weight":
+            shown[col] = "—"
+        elif col in ("physical_state", "half_life"):
+            shown[col] = "—"
+        else:
+            shown[col] = work[col].apply(lambda v: str(v) if pd.notna(v) else "—")
+
+    for idx, row in work.iterrows():
+        fs = dict(fs_series.get(idx, {}))
+        fs.update({k: v for k, v in dose_field_sources(row).items() if k not in fs or k == "max_dose_mg"})
+
+        if pd.notna(row.get("molecular_weight")):
             shown.at[idx, "molecular_weight"] = format_value_with_badge(
                 round(float(row["molecular_weight"]), 2),
                 "molecular_weight",
@@ -568,36 +635,8 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
                 alt_value=row.get("molecular_weight_db"),
                 alt_label="DrugBank",
             )
-        if "logP" in shown.columns and pd.notna(row.get("logP")):
+        if pd.notna(row.get("logP")):
             shown.at[idx, "logP"] = format_value_with_badge(row["logP"], "logP", fs, precision=2)
-        if "mechanism_of_action" in shown.columns and pd.notna(row.get("mechanism_of_action")):
-            mech = str(row["mechanism_of_action"])
-            if len(mech) > 60:
-                mech = mech[:57] + "…"
-            shown.at[idx, "mechanism_of_action"] = format_value_with_badge(
-                mech,
-                "mechanism_of_action",
-                fs,
-                conflict=bool(row.get("mechanism_of_action_conflict")),
-                alt_value=row.get("mechanism_of_action_chembl"),
-            )
-        if "indication_class" in shown.columns and pd.notna(row.get("indication_class")):
-            ind = str(row["indication_class"])
-            if len(ind) > 60:
-                ind = ind[:57] + "…"
-            shown.at[idx, "indication_class"] = format_value_with_badge(
-                ind,
-                "indication_class",
-                fs,
-                conflict=bool(row.get("indication_class_conflict")),
-                alt_value=row.get("indication_class_chembl"),
-            )
-        if "primary_target" in shown.columns and pd.notna(row.get("primary_target")):
-            pt = str(row["primary_target"])
-            if len(pt) > 50:
-                pt = pt[:47] + "…"
-            shown.at[idx, "primary_target"] = pt
-
         for col in ["pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg"]:
             if col in shown.columns and pd.notna(row.get(col)):
                 shown.at[idx, col] = format_value_with_badge(row[col], col, fs, precision=2)
@@ -607,10 +646,35 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
                 if len(val) > 50:
                     val = val[:47] + "…"
                 shown.at[idx, col] = format_value_with_badge(val, col, fs)
+        for col, conflict_col, alt_col in (
+            ("mechanism_of_action", "mechanism_of_action_conflict", "mechanism_of_action_chembl"),
+            ("indication_class", "indication_class_conflict", "indication_class_chembl"),
+        ):
+            if col in shown.columns and pd.notna(row.get(col)):
+                text = str(row[col])
+                if len(text) > 60:
+                    text = text[:57] + "…"
+                shown.at[idx, col] = format_value_with_badge(
+                    text,
+                    col,
+                    fs,
+                    conflict=bool(row.get(conflict_col)),
+                    alt_value=row.get(alt_col),
+                )
 
-    for col in ["PSA", "vapor_pressure_mmhg", "melting_point_c"]:
-        if col in shown.columns:
-            shown[col] = shown[col].round(2)
+    # Drop helper column from display but keep for styling (avoid duplicate column)
+    display_order = [c for c in display_cols if c in shown.columns and c != "nosa_candidate"]
+    return shown[display_order + ["nosa_candidate"]], truncated
+
+
+def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    shown, _ = prepare_results_table(df)
+    nosa = shown.pop("nosa_candidate").astype(bool)
+
+    def highlight_nosa(row: pd.Series) -> list[str]:
+        if nosa.iloc[row.name]:
+            return [f"background-color: {ACCENT}; color: {PRIMARY}; font-weight: 600"] * len(row)
+        return [f"background-color: {SURFACE}; color: {TEXT}"] * len(row)
 
     def dose_badge_style(row: pd.Series) -> list[str]:
         base = highlight_nosa(row)
@@ -626,10 +690,7 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             base[dose_idx] = f"background-color: {DISABLED}; color: {TEXT}; font-weight: 700"
         return base
 
-    return shown.style.apply(dose_badge_style, axis=1).format(
-        {"composite_score": "{:.1f}"},
-        na_rep="—",
-    )
+    return shown.style.apply(dose_badge_style, axis=1)
 
 
 def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
@@ -652,7 +713,7 @@ def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
         st.markdown("**Data sources**")
         if sources:
             source_rows = [{"Field": k, "Source": v.upper() if v == "drugbank" else v.title()} for k, v in sorted(sources.items())]
-            st.dataframe(pd.DataFrame(source_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(source_rows), width="stretch", hide_index=True)
         else:
             st.info("No source mapping recorded for this compound.")
 
@@ -892,6 +953,12 @@ def reset_all_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
         st.session_state[f"hide_phase_{phase}"] = False
     st.session_state["hide_patent_yes"] = False
     st.session_state["hide_patent_no"] = False
+    st.session_state["filter_cns_only"] = False
+    st.session_state["filter_hide_nasal_cyp"] = False
+    st.session_state["filter_hide_pgp"] = False
+    for key in ("filter_routes_pills", "filter_atc_pills"):
+        if key in st.session_state:
+            del st.session_state[key]
 
 
 def render_pubchem_filters(
@@ -954,6 +1021,66 @@ def unique_pipe_values(series: pd.Series) -> list[str]:
     return sorted(set(values))
 
 
+def token_counts(df: pd.DataFrame, token_col: str, options: list[str]) -> dict[str, int]:
+    counts = {opt: 0 for opt in options}
+    if token_col not in df.columns:
+        return counts
+    for opt in options:
+        counts[opt] = int(df[token_col].map(lambda tokens: opt in tokens).sum())
+    return counts
+
+
+def render_pills_filter(
+    label: str,
+    options: list[str],
+    counts: dict[str, int],
+    labels: dict[str, str],
+    session_key: str,
+) -> list[str]:
+    """Multi-select pill toggles with drug counts."""
+    if not options:
+        return []
+
+    st.markdown(f"**{label}**")
+    format_opts = [f"{labels.get(opt, opt)} ({counts.get(opt, 0):,})" for opt in options]
+    display_to_value = dict(zip(format_opts, options))
+    pills_key = f"{session_key}_pills"
+
+    if pills_key not in st.session_state:
+        st.session_state[pills_key] = format_opts
+
+    selected_display = st.pills(
+        label,
+        options=format_opts,
+        selection_mode="multi",
+        key=pills_key,
+        label_visibility="collapsed",
+    )
+    if selected_display is None:
+        selected_display = []
+
+    selected = [display_to_value[item] for item in selected_display if item in display_to_value]
+
+    n_sel = len(selected)
+    n_all = len(options)
+    if n_sel == n_all:
+        st.caption(f"All {n_all} selected")
+    elif n_sel == 0:
+        st.caption("None selected — no drugs will match")
+    else:
+        st.caption(f"{n_sel} of {n_all} selected")
+
+    btn1, btn2 = st.columns(2)
+    if btn1.button("Select all", key=f"{session_key}_all", use_container_width=True):
+        st.session_state[pills_key] = format_opts
+        st.rerun()
+    if btn2.button("Clear all", key=f"{session_key}_clear", use_container_width=True):
+        st.session_state[pills_key] = []
+        st.rerun()
+
+    return selected
+
+
 def render_clinical_filters(
     df: pd.DataFrame,
     slider_ranges: dict[str, tuple[float, float]],
@@ -978,22 +1105,31 @@ def render_clinical_filters(
             FILTER_STEPS[col],
         )
 
+    st.markdown("**Route & therapeutic area**")
+    st.caption("Click pills to toggle. Drugs missing route/ATC data are hidden when filtering.")
+
     all_routes = unique_pipe_values(df["route_of_administration"]) if "route_of_administration" in df.columns else []
     all_atc = unique_pipe_values(df["atc_level1"]) if "atc_level1" in df.columns else []
 
     selected_routes = all_routes
     selected_atc = all_atc
     if all_routes:
-        selected_routes = st.multiselect(
+        route_counts = token_counts(df, "_route_tokens", all_routes)
+        selected_routes = render_pills_filter(
             "Route of administration",
-            options=all_routes,
-            default=all_routes,
+            all_routes,
+            route_counts,
+            ROUTE_LABELS,
+            "filter_routes",
         )
     if all_atc:
-        selected_atc = st.multiselect(
+        atc_counts = token_counts(df, "_atc_tokens", all_atc)
+        selected_atc = render_pills_filter(
             "ATC level 1 (therapeutic area)",
-            options=all_atc,
-            default=all_atc,
+            all_atc,
+            atc_counts,
+            ATC_LEVEL1_NAMES,
+            "filter_atc",
         )
 
     return bounds, selected_routes, selected_atc
@@ -1110,9 +1246,14 @@ def main() -> None:
         if passing == 0:
             st.warning("No drugs match the current filters. Widen the sliders.")
         else:
+            if passing > DISPLAY_ROW_LIMIT:
+                st.caption(
+                    f"Showing top {DISPLAY_ROW_LIMIT:,} of {passing:,} results "
+                    f"(download CSV for the full filtered list)."
+                )
             st.dataframe(
                 style_results_table(filtered),
-                use_container_width=True,
+                width="stretch",
                 height=480,
             )
         render_drug_detail_panel(filtered)
@@ -1120,7 +1261,7 @@ def main() -> None:
     with col_chart:
         st.subheader("logP vs molecular weight")
         if passing > 0:
-            st.plotly_chart(build_scatter(filtered, ideal), use_container_width=True)
+            st.plotly_chart(build_scatter(filtered, ideal), width="stretch")
         else:
             st.info("Scatter plot appears when at least one drug passes filters.")
 

@@ -195,7 +195,7 @@ def main() -> None:
         print(f"[8] Memantine score: {mem_score:.1f}, rank {rank}/{len(filtered)}")
     else:
         warnings.append(
-            "Memantine excluded from default view (likely logD outside Stanko 1–4, not missing data)"
+            "Memantine excluded from default view (likely logD outside 1–4, not missing data)"
         )
 
     pubchem_ok = has_pubchem_data(df)
