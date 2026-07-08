@@ -582,89 +582,105 @@ def prepare_results_table(df: pd.DataFrame, limit: int = DISPLAY_ROW_LIMIT) -> t
     truncated = len(df) > limit
     work = df.head(limit).reset_index(drop=True)
 
+    if work.empty:
+        order = [c for c in display_cols if c != "nosa_candidate"]
+        empty = pd.DataFrame({c: pd.Series(dtype="object") for c in order})
+        empty["nosa_candidate"] = pd.Series(dtype="bool")
+        return empty, truncated
+
     if "field_sources" in work.columns:
         fs_series = work["field_sources"].map(parse_field_sources)
     else:
         fs_series = pd.Series([{}] * len(work), index=work.index)
 
-    shown = pd.DataFrame(index=work.index)
-    shown["nosa_candidate"] = work["nosa_candidate"] if "nosa_candidate" in work.columns else False
+    def field_sources_for(row: pd.Series) -> dict[str, str]:
+        fs = dict(fs_series.get(row.name, {}))
+        fs.update({k: v for k, v in dose_field_sources(row).items() if k not in fs or k == "max_dose_mg"})
+        return fs
 
+    def mol_weight_cell(row: pd.Series) -> str:
+        if pd.isna(row.get("molecular_weight")):
+            return "—"
+        return format_value_with_badge(
+            round(float(row["molecular_weight"]), 2),
+            "molecular_weight",
+            field_sources_for(row),
+            conflict=bool(row.get("mw_conflict")),
+            alt_value=row.get("molecular_weight_db"),
+            alt_label="DrugBank",
+        )
+
+    def numeric_badge_cell(row: pd.Series, col: str) -> str:
+        if pd.isna(row.get(col)):
+            return "—"
+        return format_value_with_badge(row[col], col, field_sources_for(row), precision=2)
+
+    def text_badge_cell(row: pd.Series, col: str) -> str:
+        if pd.isna(row.get(col)):
+            return "—"
+        val = str(row[col])
+        if len(val) > 50:
+            val = val[:47] + "…"
+        return format_value_with_badge(val, col, field_sources_for(row))
+
+    def conflict_text_cell(row: pd.Series, col: str, conflict_col: str, alt_col: str) -> str:
+        if pd.isna(row.get(col)):
+            return "—"
+        text = str(row[col])
+        if len(text) > 60:
+            text = text[:57] + "…"
+        return format_value_with_badge(
+            text,
+            col,
+            field_sources_for(row),
+            conflict=bool(row.get(conflict_col)),
+            alt_value=row.get(alt_col),
+        )
+
+    conflict_cols = {
+        "mechanism_of_action": ("mechanism_of_action_conflict", "mechanism_of_action_chembl"),
+        "indication_class": ("indication_class_conflict", "indication_class_chembl"),
+    }
+
+    columns: dict[str, list[str]] = {}
     for col in display_cols:
         if col == "nosa_candidate":
             continue
         if col == "composite_score":
-            shown[col] = work[col].round(1).astype(str)
+            values = work[col].round(1).astype(str)
         elif col == "chembl_max_phase":
-            shown[col] = work[col].apply(lambda v: str(int(v)) if pd.notna(v) else "—")
+            values = work[col].apply(lambda v: str(int(v)) if pd.notna(v) else "—")
         elif col == "dose_feasible_nosa":
-            shown[col] = work[col].map(
-                lambda v: "✓" if v is True else "✗" if v is False else "?"
-            )
+            values = work[col].map(lambda v: "✓" if v is True else "✗" if v is False else "?")
         elif col == "cns_target":
-            shown[col] = work[col].map(lambda v: "🧠" if v is True else "")
+            values = work[col].map(lambda v: "🧠" if v is True else "")
         elif col == "nasal_cyp_risk":
-            shown[col] = work[col].map(lambda v: "⚠️" if v is True else "")
+            values = work[col].map(lambda v: "⚠️" if v is True else "")
         elif col in ("PSA", "vapor_pressure_mmhg", "melting_point_c"):
-            shown[col] = work[col].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
+            values = work[col].apply(lambda v: f"{v:.2f}" if pd.notna(v) else "—")
         elif col == "primary_target":
-            shown[col] = work[col].apply(
+            values = work[col].apply(
                 lambda v: (str(v)[:47] + "…") if pd.notna(v) and len(str(v)) > 50 else (str(v) if pd.notna(v) else "—")
             )
-        elif col in ("mechanism_of_action", "indication_class"):
-            shown[col] = "—"
-        elif col in ("pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg", "logP"):
-            shown[col] = "—"
         elif col == "molecular_weight":
-            shown[col] = "—"
+            values = work.apply(mol_weight_cell, axis=1)
+        elif col in ("logP", "pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg"):
+            values = work.apply(lambda row, c=col: numeric_badge_cell(row, c), axis=1)
         elif col in ("physical_state", "half_life"):
-            shown[col] = "—"
+            values = work.apply(lambda row, c=col: text_badge_cell(row, c), axis=1)
+        elif col in conflict_cols:
+            cc, ac = conflict_cols[col]
+            values = work.apply(lambda row, c=col, cc=cc, ac=ac: conflict_text_cell(row, c, cc, ac), axis=1)
         else:
-            shown[col] = work[col].apply(lambda v: str(v) if pd.notna(v) else "—")
+            values = work[col].apply(lambda v: str(v) if pd.notna(v) else "—")
+        columns[col] = list(values)
 
-    for idx, row in work.iterrows():
-        fs = dict(fs_series.get(idx, {}))
-        fs.update({k: v for k, v in dose_field_sources(row).items() if k not in fs or k == "max_dose_mg"})
-
-        if pd.notna(row.get("molecular_weight")):
-            shown.at[idx, "molecular_weight"] = format_value_with_badge(
-                round(float(row["molecular_weight"]), 2),
-                "molecular_weight",
-                fs,
-                conflict=bool(row.get("mw_conflict")),
-                alt_value=row.get("molecular_weight_db"),
-                alt_label="DrugBank",
-            )
-        if pd.notna(row.get("logP")):
-            shown.at[idx, "logP"] = format_value_with_badge(row["logP"], "logP", fs, precision=2)
-        for col in ["pka_predicted", "logD_pH6", "logD_pH74", "max_dose_mg"]:
-            if col in shown.columns and pd.notna(row.get(col)):
-                shown.at[idx, col] = format_value_with_badge(row[col], col, fs, precision=2)
-        for col in ["physical_state", "half_life"]:
-            if col in shown.columns and pd.notna(row.get(col)):
-                val = str(row[col])
-                if len(val) > 50:
-                    val = val[:47] + "…"
-                shown.at[idx, col] = format_value_with_badge(val, col, fs)
-        for col, conflict_col, alt_col in (
-            ("mechanism_of_action", "mechanism_of_action_conflict", "mechanism_of_action_chembl"),
-            ("indication_class", "indication_class_conflict", "indication_class_chembl"),
-        ):
-            if col in shown.columns and pd.notna(row.get(col)):
-                text = str(row[col])
-                if len(text) > 60:
-                    text = text[:57] + "…"
-                shown.at[idx, col] = format_value_with_badge(
-                    text,
-                    col,
-                    fs,
-                    conflict=bool(row.get(conflict_col)),
-                    alt_value=row.get(alt_col),
-                )
-
-    # Drop helper column from display but keep for styling (avoid duplicate column)
-    display_order = [c for c in display_cols if c in shown.columns and c != "nosa_candidate"]
-    return shown[display_order + ["nosa_candidate"]], truncated
+    display_order = [c for c in display_cols if c != "nosa_candidate" and c in columns]
+    shown = pd.DataFrame({c: columns[c] for c in display_order}, index=work.index, dtype="object")
+    shown["nosa_candidate"] = (
+        work["nosa_candidate"].astype(bool) if "nosa_candidate" in work.columns else False
+    )
+    return shown, truncated
 
 
 def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
