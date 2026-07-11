@@ -198,6 +198,137 @@ def parse_orange_book_date(value: str) -> pd.Timestamp | pd.NaT:
         return pd.NaT
 
 
+COMPANY_ALIASES: dict[str, list[str]] = {
+    "pfizer": ["pfizer inc", "pfizer laboratories", "pf prism", "pfizer labs", "pfizer ireland"],
+    "roche": ["hoffmann la roche", "genentech", "roche", "f hoffmann la roche"],
+    "novartis": ["novartis pharms", "novartis ag", "sandoz", "novartis pharmaceuticals"],
+    "astrazeneca": ["astrazeneca ab", "astrazeneca pharms", "az", "astrazeneca uk"],
+    "merck": ["merck sharp dohme", "msd", "merck co", "merck sharp and dohme"],
+    "gsk": ["glaxosmithkline", "glaxo", "gsk", "glaxo group", "glaxo wellcome"],
+    "sanofi": ["sanofi aventis", "sanofi winthrop", "genzyme", "sanofi pasteur"],
+    "abbvie": ["abbvie inc", "abbott", "abbvie"],
+    "lilly": ["eli lilly", "lilly co", "eli lilly and co"],
+    "bms": ["bristol myers squibb", "bristol myers", "celgene"],
+    "j&j": ["johnson johnson", "janssen", "jnj", "janssen pharmaceutica", "janssen products"],
+    "bayer": ["bayer ag", "bayer healthcare", "bayer corp", "bayer pharmaceuticals"],
+    "teva": ["teva pharms", "teva usa", "teva pharmaceutical"],
+    "takeda": ["takeda pharmaceuticals", "shire", "takeda pharma"],
+    "boehringer": ["boehringer ingelheim", "boehringer ingelheim pharma"],
+    "amgen": ["amgen inc", "amgen"],
+    "gilead": ["gilead sciences", "gilead"],
+    "biogen": ["biogen inc", "biogen idec"],
+    "regeneron": ["regeneron pharmaceuticals", "regeneron"],
+    "vertex": ["vertex pharmaceuticals", "vertex"],
+}
+
+CANONICAL_DISPLAY: dict[str, str] = {
+    "pfizer": "Pfizer",
+    "roche": "Roche",
+    "novartis": "Novartis",
+    "astrazeneca": "AstraZeneca",
+    "merck": "Merck",
+    "gsk": "GSK",
+    "sanofi": "Sanofi",
+    "abbvie": "AbbVie",
+    "lilly": "Lilly",
+    "bms": "BMS",
+    "j&j": "J&J",
+    "bayer": "Bayer",
+    "teva": "Teva",
+    "takeda": "Takeda",
+    "boehringer": "Boehringer Ingelheim",
+    "amgen": "Amgen",
+    "gilead": "Gilead",
+    "biogen": "Biogen",
+    "regeneron": "Regeneron",
+    "vertex": "Vertex",
+}
+
+BIG_PHARMA_KEYS = frozenset(COMPANY_ALIASES)
+
+PATENT_OWNER_COLUMNS = [
+    "original_applicant",
+    "original_applicant_normalized",
+    "all_applicants",
+    "applicant_count",
+    "big_pharma_owned",
+]
+
+_COMPANY_SUFFIX_RE = re.compile(
+    r"\b("
+    r"inc\.?|ltd\.?|llc|corp\.?|corporation|gmbh|plc|ab|sa|co\.?|lp|llp|ag|bv|nv|"
+    r"usa|us|pharmaceuticals?|pharma|pharms?|labs?|laboratories?|healthcare|"
+    r"group|industries|medical|therapeutics?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_company_key(name: str) -> str:
+    text = str(name).lower().strip()
+    text = re.sub(r"[^\w\s&]", " ", text)
+    text = _COMPANY_SUFFIX_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def resolve_canonical_company(name: str | None) -> tuple[str | None, str | None]:
+    """Return (display_name, canonical_key) for a raw Orange Book applicant name."""
+    if name is None or not str(name).strip():
+        return None, None
+    key = normalize_company_key(name)
+    if not key:
+        return None, None
+    for canonical, aliases in COMPANY_ALIASES.items():
+        candidates = [canonical, *aliases]
+        for candidate in candidates:
+            cand = normalize_company_key(candidate)
+            if not cand:
+                continue
+            if key == cand or cand in key or key in cand:
+                return CANONICAL_DISPLAY[canonical], canonical
+    display = " ".join(part.capitalize() for part in key.split())
+    return display, None
+
+
+def is_big_pharma_company(name: str | None) -> bool:
+    _, canonical = resolve_canonical_company(name)
+    return canonical in BIG_PHARMA_KEYS
+
+
+def aggregate_ingredient_applicants(group: pd.DataFrame) -> pd.Series:
+    applicants = group["applicant_name"].dropna().astype(str).str.strip()
+    applicants = applicants[applicants != ""]
+    unique_by_key: dict[str, str] = {}
+    for applicant in applicants:
+        dedupe_key = applicant.casefold()
+        if dedupe_key not in unique_by_key:
+            unique_by_key[dedupe_key] = applicant
+
+    dated = group.dropna(subset=["approval_date"])
+    if not dated.empty:
+        original_row = dated.loc[dated["approval_date"].idxmin()]
+    else:
+        nda_rows = group[group["Appl_Type"] == "N"]
+        original_row = nda_rows.iloc[0] if not nda_rows.empty else group.iloc[0]
+
+    original_applicant = str(original_row.get("applicant_name", "")).strip() or None
+    normalized, _ = resolve_canonical_company(original_applicant)
+    all_applicants = "|".join(sorted(unique_by_key.values(), key=str.casefold)) if unique_by_key else None
+
+    return pd.Series(
+        {
+            "ingredient": group["ingredient"].iloc[0],
+            "earliest_patent_expiry": group["patent_expiry"].min(),
+            "earliest_exclusivity_date": group["exclusivity_date"].min(),
+            "original_applicant": original_applicant,
+            "original_applicant_normalized": normalized,
+            "all_applicants": all_applicants,
+            "applicant_count": len(unique_by_key) if unique_by_key else 0,
+            "big_pharma_owned": is_big_pharma_company(original_applicant),
+        }
+    )
+
+
 def iter_batches(items: list[str], size: int = BATCH_SIZE) -> list[list[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
@@ -570,8 +701,10 @@ def load_orange_book() -> pd.DataFrame:
     merged = products.merge(patents, on=key_cols, how="left").merge(
         exclusivity, on=key_cols, how="left"
     )
+    merged["applicant_name"] = merged["Applicant_Full_Name"].fillna(merged["Applicant"]).str.strip()
+    merged["approval_date"] = merged["Approval_Date"].map(parse_orange_book_date)
 
-    ingredient_rows: list[dict] = []
+    ingredient_rows: list[dict[str, Any]] = []
     for _, row in merged.iterrows():
         ingredients = [
             part.strip() for part in str(row["Ingredient"]).split(";") if part.strip()
@@ -581,19 +714,34 @@ def load_orange_book() -> pd.DataFrame:
                 {
                     "ingredient": ingredient,
                     "name_key": normalize_name(ingredient),
+                    "Appl_Type": row["Appl_Type"],
+                    "applicant_name": row["applicant_name"],
+                    "approval_date": row["approval_date"],
                     "patent_expiry": row["patent_expiry"],
                     "exclusivity_date": row["exclusivity_date"],
                 }
             )
 
-    return (
-        pd.DataFrame(ingredient_rows)
-        .groupby("name_key", as_index=False)
-        .agg(
-            ingredient=("ingredient", "first"),
-            earliest_patent_expiry=("patent_expiry", "min"),
-            earliest_exclusivity_date=("exclusivity_date", "min"),
+    if not ingredient_rows:
+        return pd.DataFrame(
+            columns=[
+                "name_key",
+                "ingredient",
+                "earliest_patent_expiry",
+                "earliest_exclusivity_date",
+                "original_applicant",
+                "original_applicant_normalized",
+                "all_applicants",
+                "applicant_count",
+                "big_pharma_owned",
+            ]
         )
+
+    ing_df = pd.DataFrame(ingredient_rows)
+    return (
+        ing_df.groupby("name_key", as_index=False)
+        .apply(aggregate_ingredient_applicants, include_groups=False)
+        .reset_index(drop=True)
     )
 
 
@@ -1372,6 +1520,10 @@ def print_build_summary(stats: dict[str, int]) -> None:
     print(f"  Dose ≤ 100mg (NOSA feasible):  {stats['dose_feasible']:>7,}")
     print(f"  Dose > 100mg (excluded):       {stats['dose_excluded']:>7,}")
     print(f"  Dose unknown:                  {stats['dose_unknown']:>7,}")
+    print("  ── Patent ownership ──────────────────────────────")
+    print(f"  Applicant data extracted:      {stats['applicant_rows']:>7,}")
+    print(f"  Big pharma-owned (top 20):     {stats['big_pharma_owned']:>7,}")
+    print(f"  Generic-only (no big pharma):  {stats['generic_only']:>7,}")
     print("  ────────────────────────────────────────────────")
     print(f"  TOTAL ROWS:                    {stats['total_rows']:>7,}")
     print(f"  Output → {OUTPUT_CSV.name}")
@@ -1399,6 +1551,9 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "dose_feasible": 0,
         "dose_excluded": 0,
         "dose_unknown": 0,
+        "applicant_rows": 0,
+        "big_pharma_owned": 0,
+        "generic_only": 0,
         "total_rows": 0,
     }
 
@@ -1527,6 +1682,11 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "ingredient",
         "earliest_patent_expiry",
         "earliest_exclusivity_date",
+        "original_applicant",
+        "original_applicant_normalized",
+        "all_applicants",
+        "applicant_count",
+        "big_pharma_owned",
         "ema_approved",
         "pmda_approved",
         "route_of_administration",
@@ -1553,14 +1713,35 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     stats["dose_feasible"] = int((merged["dose_feasible_nosa"] == True).sum())
     stats["dose_excluded"] = int((merged["dose_feasible_nosa"] == False).sum())
     stats["dose_unknown"] = int(merged["dose_feasible_nosa"].isna().sum())
+    stats["applicant_rows"] = int(merged["original_applicant"].notna().sum())
+    stats["big_pharma_owned"] = int(merged["big_pharma_owned"].fillna(False).astype(bool).sum())
+    stats["generic_only"] = int(
+        (merged["original_applicant"].notna() & ~merged["big_pharma_owned"].fillna(False).astype(bool)).sum()
+    )
     stats["total_rows"] = len(merged)
     return merged, stats
+
+
+def sync_patent_columns_to_enriched(master: pd.DataFrame) -> None:
+    """Merge patent-owner columns into enriched CSV when it exists."""
+    if not ENRICHED_CSV.exists():
+        return
+    cols = [c for c in PATENT_OWNER_COLUMNS if c in master.columns]
+    if not cols:
+        return
+    enriched = pd.read_csv(ENRICHED_CSV, low_memory=False)
+    update = master[["name", *cols]].drop_duplicates(subset="name", keep="first")
+    enriched = enriched.drop(columns=[c for c in cols if c in enriched.columns], errors="ignore")
+    enriched = enriched.merge(update, on="name", how="left")
+    enriched.to_csv(ENRICHED_CSV, index=False)
+    print(f"  Patent-owner columns synced → {ENRICHED_CSV.name}")
 
 
 def main() -> None:
     args = parse_args()
     df, stats = build_database(skip_chembl=args.skip_chembl)
     df.to_csv(OUTPUT_CSV, index=False)
+    sync_patent_columns_to_enriched(df)
     print_build_summary(stats)
     print_drugbank_summary(stats)
 

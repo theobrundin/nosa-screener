@@ -258,6 +258,8 @@ def load_database(path_str: str) -> pd.DataFrame:
         df["nasal_cyp_risk"] = df["nasal_cyp_risk"].astype("boolean").fillna(False).astype(bool)
     if "pgp_substrate" in df.columns:
         df["pgp_substrate"] = df["pgp_substrate"].astype("boolean").fillna(False).astype(bool)
+    if "big_pharma_owned" in df.columns:
+        df["big_pharma_owned"] = df["big_pharma_owned"].astype("boolean").fillna(False).astype(bool)
     if "route_of_administration" in df.columns:
         df["_route_tokens"] = df["route_of_administration"].map(
             lambda v: frozenset(_split_pipe_values(v))
@@ -389,6 +391,22 @@ def apply_categorical_filters(
     return df.loc[mask]
 
 
+def apply_applicant_filters(
+    df: pd.DataFrame,
+    selected_companies: list[str],
+    big_pharma_only: bool,
+) -> pd.DataFrame:
+    mask = pd.Series(True, index=df.index)
+
+    if selected_companies and "original_applicant_normalized" in df.columns:
+        mask &= df["original_applicant_normalized"].isin(selected_companies)
+
+    if big_pharma_only and "big_pharma_owned" in df.columns:
+        mask &= df["big_pharma_owned"].fillna(False).astype(bool)
+
+    return df.loc[mask]
+
+
 def apply_metadata_filters(
     df: pd.DataFrame,
     hide_phases: set[int],
@@ -443,6 +461,46 @@ def render_metadata_filters(df: pd.DataFrame) -> tuple[set[int], bool, bool]:
     )
 
     return hide_phases, hide_with_patent, hide_without_patent
+
+
+def render_applicant_filters(df: pd.DataFrame) -> tuple[list[str], bool]:
+    if "original_applicant_normalized" not in df.columns:
+        return [], False
+
+    st.subheader("Patent holder")
+    companies = sorted(df["original_applicant_normalized"].dropna().unique())
+    if not companies:
+        st.caption("Rebuild database to enable patent holder filters.")
+        return [], False
+
+    counts = df["original_applicant_normalized"].value_counts()
+    options = [f"{company} ({counts.get(company, 0):,})" for company in companies]
+    display_to_value = dict(zip(options, companies))
+
+    selected_display = st.multiselect(
+        "Filter by patent holder",
+        options=options,
+        default=[],
+        key="filter_applicants",
+        placeholder="All companies",
+    )
+    selected = [display_to_value[item] for item in selected_display if item in display_to_value]
+
+    if selected:
+        n = int(df["original_applicant_normalized"].isin(selected).sum())
+        st.caption(f"{n:,} drugs from selected companies")
+    else:
+        st.caption("No companies selected — all patent holders shown")
+
+    big_pharma_only = False
+    if "big_pharma_owned" in df.columns:
+        n_big = int(df["big_pharma_owned"].fillna(False).astype(bool).sum())
+        big_pharma_only = st.checkbox(
+            f"Show only big pharma-originated drugs ({n_big:,})",
+            key="filter_big_pharma_only",
+        )
+
+    return selected, big_pharma_only
 
 
 def has_drugbank_annotations(df: pd.DataFrame) -> bool:
@@ -566,6 +624,8 @@ def prepare_results_table(df: pd.DataFrame, limit: int = DISPLAY_ROW_LIMIT) -> t
         "logD_pH74",
         "max_dose_mg",
         "dose_feasible_nosa",
+        "original_applicant_normalized",
+        "earliest_patent_expiry",
         "atc_code",
         "mesh_heading",
         "mechanism_of_action",
@@ -770,6 +830,26 @@ def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
             for line in dose_lines:
                 st.markdown(line)
 
+        ownership_lines: list[str] = []
+        if pd.notna(row.get("original_applicant_normalized")):
+            ownership_lines.append(f"**Original holder:** {row['original_applicant_normalized']}")
+        if pd.notna(row.get("original_applicant")) and row.get("original_applicant") != row.get(
+            "original_applicant_normalized"
+        ):
+            ownership_lines.append(f"**Original applicant (Orange Book):** {row['original_applicant']}")
+        if pd.notna(row.get("all_applicants")):
+            ownership_lines.append(
+                f"**All applicants:** {str(row['all_applicants']).replace('|', ' · ')}"
+            )
+        if pd.notna(row.get("applicant_count")):
+            ownership_lines.append(f"**Applicant count:** {int(row['applicant_count'])}")
+        if pd.notna(row.get("earliest_patent_expiry")):
+            ownership_lines.append(f"**Earliest patent expiry:** {row['earliest_patent_expiry']}")
+        if ownership_lines:
+            st.markdown("**Patent & ownership**")
+            for line in ownership_lines:
+                st.markdown(line)
+
         if pd.notna(row.get("target_names")):
             st.markdown("**Targets (DrugBank)**")
             st.markdown(str(row["target_names"]).replace("|", " · "))
@@ -972,6 +1052,8 @@ def reset_all_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
     st.session_state["filter_cns_only"] = False
     st.session_state["filter_hide_nasal_cyp"] = False
     st.session_state["filter_hide_pgp"] = False
+    st.session_state["filter_applicants"] = []
+    st.session_state["filter_big_pharma_only"] = False
     for key in ("filter_routes_pills", "filter_atc_pills"):
         if key in st.session_state:
             del st.session_state[key]
@@ -1230,6 +1312,9 @@ def main() -> None:
         hide_phases, hide_with_patent, hide_without_patent = render_metadata_filters(df)
 
         st.divider()
+        selected_applicants, big_pharma_only = render_applicant_filters(df)
+
+        st.divider()
         cns_only, hide_nasal_cyp, hide_pgp = render_drugbank_filters(df)
 
         st.divider()
@@ -1243,6 +1328,7 @@ def main() -> None:
     filtered = apply_metadata_filters(
         filtered, hide_phases, hide_with_patent, hide_without_patent
     )
+    filtered = apply_applicant_filters(filtered, selected_applicants, big_pharma_only)
     filtered = apply_drugbank_filters(filtered, cns_only, hide_nasal_cyp, hide_pgp)
     filtered["composite_score"] = composite_score(filtered, ideal, slider_ranges)
     filtered = filtered.sort_values("composite_score", ascending=False)
