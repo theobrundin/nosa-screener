@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = ROOT / "nosa_drug_database.csv"
 ENRICHED_CSV = ROOT / "nosa_drug_database_enriched.csv"
 
+from structure_match import recompute_dose_feasible_nosa, sync_unified_dose  # noqa: E402
+
 CT_API = "https://clinicaltrials.gov/api/v2/studies"
 CT_FIELDS = "protocolSection.identificationModule,protocolSection.armsInterventionsModule"
 PAGE_SIZE = 20
@@ -27,6 +29,8 @@ MAX_RETRIES = 3
 SAVE_EVERY = 500
 PROGRESS_EVERY = 100
 NOSA_DOSE_LIMIT_MG = 100.0
+MAX_PLAUSIBLE_DOSE_MG = 2000.0
+MIN_REVIEW_DOSE_MG = 0.001
 
 DOSE_COLUMNS = [
     "ct_max_dose_mg",
@@ -39,11 +43,17 @@ DOSE_COLUMNS = [
     "dose_feasible_nosa",
 ]
 
-# mg / g / µg variants; exclude mg/kg and similar weight-normalized doses
+# mg / g / µg variants; exclude mg/kg, mg/mL concentrations, and weight-normalized doses
 DOSE_RE = re.compile(
     r"(?<![/\d])(\d+(?:\.\d+)?)\s*"
     r"(mg|milligram(?:s)?|[μµ]g|ug|mcg|microgram(?:s)?|(?<![a-z])g(?![a-z/])|gram(?:s)?)"
-    r"(?!\s*/\s*kg)",
+    r"(?!\s*/\s*(?:kg|m[lL]|d|day|daily|dose))",
+    re.IGNORECASE,
+)
+
+PREFERRED_DOSE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(mg|milligram(?:s)?|[μµ]g|ug|mcg|microgram(?:s)?|(?<![a-z])g(?![a-z/])|gram(?:s)?)"
+    r"\s*(?:once\s+daily|per\s+day|/day|daily|bid|tid|qid|q\d+h|every\s+\d+\s+hours?)?",
     re.IGNORECASE,
 )
 
@@ -182,6 +192,15 @@ def normalize_unit(unit: str) -> tuple[str, float]:
     return "mg", 1.0
 
 
+def cap_dose_mg(dose_mg: float | None) -> tuple[float | None, bool]:
+    """Return capped dose and whether it was rejected as implausible."""
+    if dose_mg is None:
+        return None, False
+    if dose_mg > MAX_PLAUSIBLE_DOSE_MG:
+        return None, True
+    return dose_mg, False
+
+
 def extract_doses_from_text(text: str, drug_name: str) -> list[tuple[float, str, str]]:
     """Return (dose_mg, original_unit, snippet) for dose mentions tied to this drug."""
     results: list[tuple[float, str, str]] = []
@@ -189,18 +208,34 @@ def extract_doses_from_text(text: str, drug_name: str) -> list[tuple[float, str,
         t for t in re.split(r"[\s\-/]+", str(drug_name).lower()) if len(t) >= 4
     }
     drug_norm = normalize_drug_name(drug_name)
+    lower = text.lower()
 
-    for match in DOSE_RE.finditer(text):
-        value = float(match.group(1))
-        unit_label, factor = normalize_unit(match.group(2))
-        dose_mg = value * factor
-        start = max(0, match.start() - 40)
-        end = min(len(text), match.end() + 40)
-        snippet = text[start:end].strip()
-        snippet_norm = normalize_drug_name(snippet)
-        if drug_norm not in snippet_norm and not any(tok in snippet.lower() for tok in drug_tokens):
-            continue
-        results.append((dose_mg, unit_label, snippet))
+    # Skip concentration-only snippets (mg/mL, mg/ml)
+    if re.search(r"\d+(?:\.\d+)?\s*mg\s*/\s*ml", lower):
+        if not re.search(r"(?:once daily|per day|/day|daily|bid|tid|qid)", lower):
+            return results
+
+    patterns = [PREFERRED_DOSE_RE, DOSE_RE]
+    seen_spans: set[tuple[int, int]] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            span = (match.start(), match.end())
+            if span in seen_spans:
+                continue
+            seen_spans.add(span)
+            value = float(match.group(1))
+            unit_label, factor = normalize_unit(match.group(2))
+            dose_mg = value * factor
+            dose_mg, rejected = cap_dose_mg(dose_mg)
+            if rejected:
+                continue
+            start = max(0, match.start() - 40)
+            end = min(len(text), match.end() + 40)
+            snippet = text[start:end].strip()
+            snippet_norm = normalize_drug_name(snippet)
+            if drug_norm not in snippet_norm and not any(tok in snippet.lower() for tok in drug_tokens):
+                continue
+            results.append((dose_mg, unit_label, snippet))
     return results
 
 
@@ -230,6 +265,13 @@ def enrich_drug(drug_name: str, session: requests.Session) -> dict[str, Any]:
 
     ct_feasible: bool | None = None
     if best_mg is not None:
+        best_mg, rejected = cap_dose_mg(best_mg)
+        if rejected:
+            best_mg = None
+            best_raw = f"REJECTED>{MAX_PLAUSIBLE_DOSE_MG}mg: {best_raw}"
+        elif best_mg is not None and best_mg < MIN_REVIEW_DOSE_MG:
+            best_raw = f"REVIEW_UG? {best_raw}"
+    if best_mg is not None:
         ct_feasible = best_mg <= NOSA_DOSE_LIMIT_MG
 
     return {
@@ -242,25 +284,12 @@ def enrich_drug(drug_name: str, session: requests.Session) -> dict[str, Any]:
 
 
 def apply_unified_dose(row: pd.Series) -> pd.Series:
-    chembl = row.get("max_clinical_dose_mg")
-    ct = row.get("ct_max_dose_mg")
+    return sync_unified_dose(row)
 
-    if pd.notna(chembl):
-        row["max_dose_mg"] = float(chembl)
-        row["max_dose_source"] = "chembl"
-    elif pd.notna(ct):
-        row["max_dose_mg"] = float(ct)
-        row["max_dose_source"] = "clinicaltrials"
-    else:
-        row["max_dose_mg"] = None
-        row["max_dose_source"] = None
 
-    dose = row.get("max_dose_mg")
-    if pd.isna(dose):
-        row["dose_feasible_nosa"] = None
-    else:
-        row["dose_feasible_nosa"] = float(dose) <= NOSA_DOSE_LIMIT_MG
-    return row
+def finalize_all_doses(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.apply(sync_unified_dose, axis=1)
+    return recompute_dose_feasible_nosa(df)
 
 
 def already_searched(row: pd.Series) -> bool:
@@ -375,14 +404,20 @@ def main() -> None:
             doses_found += 1
 
         if processed % SAVE_EVERY == 0:
-            df = df.apply(apply_unified_dose, axis=1)
+            df = finalize_all_doses(df)
             df.to_csv(output_path, index=False)
             print(f"  [checkpoint] saved after {processed} new lookups")
 
         if processed % PROGRESS_EVERY == 0:
             print_progress(processed, total_to_run, doses_found, studies_total)
 
-    df = df.apply(apply_unified_dose, axis=1)
+    df = finalize_all_doses(df)
+    rejected = int(df["ct_max_dose_raw"].astype(str).str.contains("REJECTED>", na=False).sum()) if "ct_max_dose_raw" in df.columns else 0
+    review = int(df["ct_max_dose_raw"].astype(str).str.contains("REVIEW_UG", na=False).sum()) if "ct_max_dose_raw" in df.columns else 0
+    if rejected:
+        print(f"  Implausible CT doses rejected (>{MAX_PLAUSIBLE_DOSE_MG} mg): {rejected:,}")
+    if review:
+        print(f"  Sub-{MIN_REVIEW_DOSE_MG} mg values flagged for review: {review:,}")
     df.to_csv(output_path, index=False)
 
     if output_path.resolve() != ENRICHED_CSV.resolve() and ENRICHED_CSV.exists():

@@ -13,6 +13,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from structure_match import recompute_dose_feasible_nosa, sanitize_dose_columns, sync_unified_dose
+
 ROOT = Path(__file__).resolve().parent
 DATABASE_CSV = ROOT / "nosa_drug_database.csv"
 ENRICHED_CSV = ROOT / "nosa_drug_database_enriched.csv"
@@ -86,9 +88,22 @@ FILTER_STEPS = {
 }
 
 CLINICAL_DEFAULTS = {
-    "pka_predicted": (3.0, 10.0),
-    "logD_pH6": (1.0, 4.0),
+    "pka_predicted": (3.0, 11.0),
+    "logD_pH6": (-2.0, 5.0),
     "max_dose_mg": (0.0, 100.0),
+}
+
+NOSA_OPTIMAL_PRESET: dict[str, tuple[float, float] | None] = {
+    "molecular_weight": (100, 400),
+    "logP": (0.5, 5.0),
+    "PSA": (0, 100),
+    "H_donors": (0, 3),
+    "rotatable_bonds": (0, 7),
+    "pka_predicted": (3, 11),
+    "logD_pH6": (-2, 5),
+    "melting_point_c": (0, 320),
+    "max_dose_mg": (0, 100),
+    "vapor_pressure_mmhg": None,  # leave fully open — data too sparse to filter
 }
 
 ATC_LEVEL1_NAMES = {
@@ -174,6 +189,18 @@ def inject_styles() -> None:
             background-color: {ACCENT} !important;
             color: {PRIMARY} !important;
             border: none;
+            font-weight: 600;
+        }}
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {{
+            background-color: {PRIMARY} !important;
+            color: {TEXT} !important;
+            border: none !important;
+            font-weight: 600;
+        }}
+        [data-testid="stSidebar"] .stButton > button[kind="secondary"] {{
+            background-color: {SURFACE} !important;
+            color: {TEXT} !important;
+            border: 1px solid {ACCENT} !important;
             font-weight: 600;
         }}
         [data-testid="stNumberInput"] button {{
@@ -268,6 +295,10 @@ def load_database(path_str: str) -> pd.DataFrame:
         df["_atc_tokens"] = df["atc_level1"].map(
             lambda v: frozenset(_split_pipe_values(v))
         )
+    df = sanitize_dose_columns(df)
+    if "max_clinical_dose_mg" in df.columns or "ct_max_dose_mg" in df.columns:
+        df = df.apply(sync_unified_dose, axis=1)
+    df = recompute_dose_feasible_nosa(df)
     return df
 
 
@@ -1035,16 +1066,42 @@ def render_range_filter(
     )
 
 
+def optimal_filter_defaults(slider_ranges: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
+    """Default bounds for sparse-optional filter logic (NOSA optimal preset)."""
+    defaults = dict(slider_ranges)
+    for col, preset in NOSA_OPTIMAL_PRESET.items():
+        if preset is not None:
+            defaults[col] = preset
+    return defaults
+
+
+def filter_default(col: str, slider_ranges: dict[str, tuple[float, float]]) -> tuple[float, float]:
+    preset = NOSA_OPTIMAL_PRESET.get(col)
+    if preset is not None:
+        return preset
+    return slider_ranges[col]
+
+
+def set_slider_bounds(col: str, lo: float, hi: float) -> None:
+    st.session_state[f"filter_{col}_lo"] = float(lo)
+    st.session_state[f"filter_{col}_hi"] = float(hi)
+    st.session_state[f"filter_{col}_slider"] = (float(lo), float(hi))
+
+
+def apply_nosa_optimal_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
+    """Apply NOSA optimal numeric slider preset (categorical toggles unchanged)."""
+    for col, (lo, hi) in optimal_filter_defaults(slider_ranges).items():
+        set_slider_bounds(col, lo, hi)
+
+
+def reset_sliders_to_full_range(slider_ranges: dict[str, tuple[float, float]]) -> None:
+    """Return all numeric sliders to their widest setting."""
+    for col, (lo, hi) in slider_ranges.items():
+        set_slider_bounds(col, lo, hi)
+
+
 def reset_all_filters(slider_ranges: dict[str, tuple[float, float]]) -> None:
-    for col, default in slider_ranges.items():
-        st.session_state[f"filter_{col}_lo"] = float(default[0])
-        st.session_state[f"filter_{col}_hi"] = float(default[1])
-        st.session_state[f"filter_{col}_slider"] = (float(default[0]), float(default[1]))
-    for col, default in CLINICAL_DEFAULTS.items():
-        if col in slider_ranges:
-            st.session_state[f"filter_{col}_lo"] = float(default[0])
-            st.session_state[f"filter_{col}_hi"] = float(default[1])
-            st.session_state[f"filter_{col}_slider"] = (float(default[0]), float(default[1]))
+    reset_sliders_to_full_range(slider_ranges)
     for phase in (1, 2, 3, 4):
         st.session_state[f"hide_phase_{phase}"] = False
     st.session_state["hide_patent_yes"] = False
@@ -1076,7 +1133,7 @@ def render_pubchem_filters(
                 col,
                 FILTER_LABELS[col],
                 *slider_ranges[col],
-                slider_ranges[col],
+                filter_default(col, slider_ranges),
                 FILTER_STEPS[col],
                 disabled=True,
             )
@@ -1086,7 +1143,7 @@ def render_pubchem_filters(
         "vapor_pressure_mmhg",
         FILTER_LABELS["vapor_pressure_mmhg"],
         *slider_ranges["vapor_pressure_mmhg"],
-        slider_ranges["vapor_pressure_mmhg"],
+        filter_default("vapor_pressure_mmhg", slider_ranges),
         FILTER_STEPS["vapor_pressure_mmhg"],
     )
     st.markdown(
@@ -1097,7 +1154,7 @@ def render_pubchem_filters(
         "melting_point_c",
         FILTER_LABELS["melting_point_c"],
         *slider_ranges["melting_point_c"],
-        slider_ranges["melting_point_c"],
+        filter_default("melting_point_c", slider_ranges),
         FILTER_STEPS["melting_point_c"],
     )
     st.markdown(
@@ -1194,12 +1251,11 @@ def render_clinical_filters(
 
     st.subheader("Clinical / ADME filters")
     for col in CLINICAL_COLUMNS:
-        default = CLINICAL_DEFAULTS.get(col, slider_ranges[col])
         bounds[col] = render_range_filter(
             col,
             FILTER_LABELS[col],
             *slider_ranges[col],
-            default,
+            filter_default(col, slider_ranges),
             FILTER_STEPS[col],
         )
 
@@ -1267,10 +1323,7 @@ def main() -> None:
     df = load_database(str(path))
     pubchem_available = has_pubchem_data(df)
     ideal, slider_ranges = active_score_config(df)
-    default_bounds = {**BASE_SLIDER_RANGES, **PUBCHEM_SLIDER_RANGES, **CLINICAL_SLIDER_RANGES}
-    for col, bounds in CLINICAL_DEFAULTS.items():
-        if col in slider_ranges:
-            default_bounds[col] = bounds
+    default_bounds = optimal_filter_defaults(slider_ranges)
     n_criteria = len(ideal) + (1 if "max_dose_mg" in df.columns else 0)
 
     st.title("NOSA Drug Screener")
@@ -1285,17 +1338,24 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Property filters")
-        st.caption("Type min/max values or drag the slider.")
-        if st.button("Reset all filters"):
-            reset_all_filters(slider_ranges)
+        st.caption(
+            "Optimal preset keeps memantine and all validated candidates in view while narrowing the field."
+        )
+        btn_opt, btn_full = st.columns(2)
+        if btn_opt.button("🎯 Apply NOSA Optimal Filters", key="apply_nosa_optimal", type="primary"):
+            apply_nosa_optimal_filters(slider_ranges)
             st.rerun()
+        if btn_full.button("↺ Reset to Full Range", key="reset_full_range", type="secondary"):
+            reset_sliders_to_full_range(slider_ranges)
+            st.rerun()
+        st.caption("Type min/max values or drag the slider.")
         bounds: dict[str, tuple[float, float]] = {}
         for col in BASE_SLIDER_RANGES:
             bounds[col] = render_range_filter(
                 col,
                 FILTER_LABELS[col],
                 *slider_ranges[col],
-                slider_ranges[col],
+                filter_default(col, slider_ranges),
                 FILTER_STEPS[col],
             )
 
@@ -1320,6 +1380,21 @@ def main() -> None:
         st.divider()
         st.markdown("**Memantine benchmark**")
         st.markdown(benchmark_text(ideal, n_criteria))
+
+        preview = apply_filters(df, bounds, default_bounds)
+        preview = apply_categorical_filters(
+            preview, selected_routes, selected_atc, all_routes, all_atc
+        )
+        preview = apply_metadata_filters(
+            preview, hide_phases, hide_with_patent, hide_without_patent
+        )
+        preview = apply_applicant_filters(preview, selected_applicants, big_pharma_only)
+        preview = apply_drugbank_filters(preview, cns_only, hide_nasal_cyp, hide_pgp)
+        preview_nosa = int(preview["nosa_candidate"].fillna(False).sum()) if len(preview) else 0
+        st.caption(
+            f"**{len(preview):,}** drugs match current filters · "
+            f"**{preview_nosa}** NOSA candidates in view"
+        )
 
     filtered = apply_filters(df, bounds, default_bounds)
     filtered = apply_categorical_filters(

@@ -14,6 +14,8 @@ from urllib.parse import quote
 import pandas as pd
 import requests
 
+from structure_match import recompute_dose_feasible_nosa
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = ROOT / "nosa_drug_database.csv"
 DEFAULT_OUTPUT = ROOT / "nosa_drug_database_enriched.csv"
@@ -102,6 +104,53 @@ def resolve_cid(name: str, session: requests.Session) -> int | None:
     except (KeyError, IndexError, TypeError, ValueError):
         return None
     return None
+
+
+def resolve_cid_from_inchikey(inchikey: str, session: requests.Session) -> int | None:
+    key = str(inchikey).strip().upper()
+    if not key:
+        return None
+    url = f"{PUG_BASE}/compound/inchikey/{quote(key, safe='')}/cids/JSON"
+    data = request_json(url, session)
+    if not data:
+        return None
+    try:
+        cids = data.get("IdentifierList", {}).get("CID") or []
+        return int(cids[0]) if cids else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def resolve_cid_from_smiles(smiles: str, session: requests.Session) -> int | None:
+    if not smiles or not str(smiles).strip():
+        return None
+    encoded = quote(str(smiles).strip(), safe="")
+    url = f"{PUG_BASE}/compound/smiles/{encoded}/cids/JSON"
+    data = request_json(url, session)
+    if not data:
+        return None
+    try:
+        cids = data.get("IdentifierList", {}).get("CID") or []
+        return int(cids[0]) if cids else None
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def resolve_cid_tiered(row: pd.Series, session: requests.Session) -> tuple[int | None, str | None]:
+    ik = row.get("inchikey") if "inchikey" in row.index else None
+    if pd.notna(ik) and str(ik).strip():
+        cid = resolve_cid_from_inchikey(str(ik), session)
+        if cid:
+            return cid, "inchikey"
+    smiles = row.get("SMILES")
+    if pd.notna(smiles) and str(smiles).strip():
+        cid = resolve_cid_from_smiles(str(smiles), session)
+        if cid:
+            return cid, "skeleton"
+    cid = resolve_cid(str(row["name"]), session)
+    if cid:
+        return cid, "name"
+    return None, None
 
 
 def extract_strings_from_information(info: dict[str, Any]) -> list[str]:
@@ -211,12 +260,13 @@ def empty_enrichment() -> dict[str, Any]:
     return {col: None for col in ENRICHMENT_COLUMNS}
 
 
-def enrich_row(name: str, session: requests.Session) -> dict[str, Any]:
+def enrich_row(row: pd.Series, session: requests.Session) -> dict[str, Any]:
     result = empty_enrichment()
-    cid = resolve_cid(name, session)
+    cid, method = resolve_cid_tiered(row, session)
     if cid is None:
         return result
     result["pubchem_cid"] = cid
+    result["pubchem_match_method"] = method
 
     property_strings = fetch_property_strings(cid, session)
     for heading, (value_col, raw_col) in PROPERTY_HEADINGS.items():
@@ -333,7 +383,8 @@ def main() -> None:
 
     for _, row in to_process.iterrows():
         name = str(row["name"])
-        enriched_rows[name] = enrich_row(name, session)
+        enriched_rows[name] = enrich_row(row, session)
+        enriched_rows[name]["pubchem_match_method"] = enriched_rows[name].get("pubchem_match_method")
         processed_new += 1
 
         if enriched_rows[name].get("vapor_pressure_mmhg") is not None:

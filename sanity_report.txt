@@ -1,0 +1,222 @@
+================================================================================
+NOSA-DB ADVANCED SANITY CHECK
+================================================================================
+OVERALL VERDICT: CRITICAL ISSUES — see FAIL flags
+
+Section 1 — Structural integrity [PASS]
+  · Primary file: nosa_drug_database_enriched.csv
+  · Total rows: 10,545 (expected 10,545)
+  ✓ Row count matches last build summary (10,545)
+  ✓ No fully duplicate rows
+  ✓ No duplicate name_key values
+  ✓ Every row has non-null name and name_key
+  · Columns present: 89
+  ✓ No 100%-null dead columns
+  ✓ No duplicated column names
+
+Section 2 — Source utilization audit [WARN]
+  · ChEMBL ID coverage: 10,534 (99.9%)
+  ·   ChEMBL field MW: 10,420 (98.8%)
+  ·   ChEMBL field logP: 9,954 (94.4%)
+  ·   ChEMBL field PSA: 9,954 (94.4%)
+  ·   ChEMBL field mechanism: 4,083 (38.7%)
+  ·   ChEMBL field ATC: 2,653 (25.2%)
+  ·   ChEMBL field MeSH: 5,310 (50.4%)
+  ⚠ ChEMBL fields far below chembl_id coverage
+      mechanism (38.7% vs chembl_id 99.9%)
+      ATC (25.2% vs chembl_id 99.9%)
+  · ChEMBL verdict: fully utilized (95.0%)
+  · DrugBank matched rows: 4,729 (44.8% of database)
+  · DrugBank source indexed (dedup name_key): 15,114
+  · Match rate vs DrugBank index: 31.3%
+  · Sample unmatched DrugBank names (10,385 total):
+  ·     - Lepirudin
+  ·     - Cetuximab
+  ·     - Dornase alfa
+  ·     - Denileukin diftitox
+  ·     - Etanercept
+  ·     - Bivalirudin
+  ·     - Leuprolide
+  ·     - Peginterferon alfa-2a
+  ·     - Alteplase
+  ·     - Sermorelin
+  · DrugBank verdict: fully utilized (31.3%)
+  · PubChem CID: 10,391 (98.5%)
+  · PubChem melting point: 1,707 (16.2%)
+  · PubChem vapor pressure: 382 (3.6%)
+  · PubChem boiling point: 473 (4.5%)
+  · PubChem verdict: fully utilized (98.5%)
+  · Orange Book patent expiry: 831 (7.9%)
+  · Orange Book applicant data: 1,874 (17.8%)
+  · ChEMBL rows without patent data: 9,703 (expected gap for non-FDA drugs)
+  · Rows with any Orange Book signal: 1,874 vs ~2,189 OB ingredients
+  · Orange Book verdict: partially utilized (17.8% of available data)
+  · Unified max dose: 2,981 (28.3%)
+  · ClinicalTrials.gov dose: 2,978 (28.2%)
+  · ClinicalTrials verdict: fully utilized (28.2%)
+
+Section 3 — Join quality and name-matching gaps [WARN]
+  · DrugBank join rate: 4,729/10,545 (44.8%)
+  · PubChem join rate: 10,391/10,545 (98.5%)
+  · Orange Book join rate: 1,874/10,545 (17.8%)
+  ⚠ 898 phase ≥3 drugs with ChEMBL ID but no DrugBank match
+      CARBACHOL (phase 4)
+      TACROLIMUS ANHYDROUS (phase 4)
+      DICHLORPHENAMIDE (phase 4)
+      ASPIRIN (phase 4)
+      PENICILLIN G (phase 4)
+      LEVOFLOXACIN ANHYDROUS (phase 4)
+      VALPROATE SODIUM (phase 4)
+      ISOPROTERENOL (phase 4)
+      ETHACRYNIC ACID (phase 4)
+      TICRYNAFEN (phase 4)
+  ✓ All NOSA candidates matched to DrugBank
+  ⚠ Potential salt-form fragmentation: 50+ prefix-related name_key pairs
+      552-02 ↔ 552-02 free base
+      abacavir ↔ abacavir hydroxyacetate
+      acefylline ↔ acefylline clofibrol
+      acefylline ↔ acefylline piperazine
+      acetic acid ↔ acetic acid c-11
+      acetylcysteine ↔ acetylcysteine lysine
+      acetylcysteine ↔ acetylcysteine zidrimer
+      aclatonium ↔ aclatonium napadisilate
+      adefovir ↔ adefovir dipivoxil
+      adenosine ↔ adenosine triphosphate
+  · Rows with SMILES but no DrugBank match: 5,617
+  · Rows with SMILES but no PubChem CID: 39
+  · InChIKey re-match estimate: could recover DrugBank data for ~5,617 rows and PubChem for ~39 rows currently missing name joins
+
+Section 4 — Calculation correctness [FAIL]
+  ✓ logD_pH6 matches acid/base recomputation in random sample (±0.05)
+  ✓ logD_pH6 vs logD_pH74 direction correct for acid/base classes
+  ✓ Memantine benchmark values within expected ranges
+  ✗ dose_feasible_nosa logic violations (2973) — 1228 CT-sourced doses ≤100 mg lack feasible flag (sync issue)
+      PRAZOSIN: max_dose_mg=3.0 feasible=nan
+      NICOTINE: max_dose_mg=21.0 feasible=nan
+      INDOMETHACIN: max_dose_mg=40.0 feasible=nan
+      AMPHETAMINE: max_dose_mg=20.0 feasible=nan
+      MIANSERIN: max_dose_mg=60.0 feasible=nan
+      INDAPAMIDE: max_dose_mg=60.0 feasible=nan
+      FLUMAZENIL: max_dose_mg=1.0 feasible=nan
+      DIAZEPAM: max_dose_mg=100.0 feasible=nan
+      MECAMYLAMINE: max_dose_mg=20.0 feasible=nan
+      METHOXSALEN: max_dose_mg=0.02 feasible=nan
+  ✓ All composite scores within 0–100
+  ⚠ Memantine excluded from default-filter view (logD default 1–4 excludes it)
+  ✓ CNS drugs average higher composite score (68.7 vs 55.0)
+  · max_dose_mg distribution: min=0.00, median=200.00, max=150000.00
+  ✗ 79 doses > 5000 mg (likely unit/parsing error)
+      ['SULBACTAM', '8000.0', 'clinicaltrials']
+      ['ETRETINATE', '7000.0', 'chembl']
+      ['PRANLUKAST', '25000.0', 'clinicaltrials']
+      ['THIOTEPA', '6000.0', 'clinicaltrials']
+      ['ECONAZOLE', '7000.0', 'clinicaltrials']
+      ['PIRACETAM', '12000.0', 'clinicaltrials']
+      ['LACTULOSE', '10000.0', 'clinicaltrials']
+      ['GLUTAMINE', '25000.0', 'clinicaltrials']
+      ['AMINOCAPROIC ACID', '6000.0', 'clinicaltrials']
+      ['EZETIMIBE', '40000.0', 'clinicaltrials']
+  ⚠ 2 suspiciously tiny doses < 0.001 mg
+      ['ELDECALCITOL', '0.00075']
+      ['GSK-2245035', '0.0002']
+  · Unit check: values should be milligrams; flag if many look like µg or grams
+
+Section 5 — Missing-data handling verification [PASS]
+  ✓ logD_pH6: all 2,797 missing rows pass at default bounds
+  ✓ max_dose_mg: all 7,564 missing rows pass at default bounds
+  ✓ melting_point_c: all 8,838 missing rows pass at default bounds
+  ✓ pka_predicted: all 2,618 missing rows pass at default bounds
+  ✓ vapor_pressure_mmhg: all 10,163 missing rows pass at default bounds
+  ✓ H_donors: missing values hard-excluded (591 rows)
+  ✓ PSA: missing values hard-excluded (591 rows)
+  ✓ logP: missing values hard-excluded (591 rows)
+  ✓ molecular_weight: missing values hard-excluded (125 rows)
+  ✓ rotatable_bonds: missing values hard-excluded (591 rows)
+  · Default filter pass count: 3,683 / 10,545 (34.9%)
+  ✓ Default pass count near expected ~3,683 (actual 3,683)
+  ✓ Narrowed pKa/logD filters exclude missing-data rows as expected
+
+Section 6 — Cross-field logical consistency [WARN]
+  ✓ No gas/ high melting point contradictions
+  ✓ big_pharma_owned always has original_applicant_normalized
+  ⚠ 2 CNS-flagged rows without mechanism or target data
+      OXITRIPTAN
+      TETRAHYDROCANNABIVARIN
+  · Patents with expiry before today (2026-07-11): 110 (informational, not necessarily wrong)
+  ✓ Patent expiry dates within 2000–2050
+  ✓ applicant_count matches pipe-separated all_applicants entries
+
+Section 7 — Conflict tracking audit [PASS]
+  · mechanism_of_action_conflict: 1,406
+  · indication_class_conflict: 3
+  · mw_conflict: 298
+  · MW conflict salt-form pattern (sample): 26/50 (52%)
+  ·     ISOSORBIDE DINITRATE: ChEMBL=236.1 DB=191.1 Δ=45.0
+  ·     MARALIXIBAT CHLORIDE: ChEMBL=710.4 DB=675.0 Δ=35.5
+  ·     PROCAINAMIDE HYDROCHLORIDE: ChEMBL=271.8 DB=235.3 Δ=36.5
+  ·     CHLORAMPHENICOL: ChEMBL=323.1 DB=423.2 Δ=100.1
+  ·     PRAVASTATIN SODIUM: ChEMBL=446.5 DB=424.5 Δ=22.0
+  ·     PRALIDOXIME CHLORIDE: ChEMBL=172.6 DB=137.2 Δ=35.5
+  ·     PYRIDOSTIGMINE BROMIDE: ChEMBL=261.1 DB=181.2 Δ=79.9
+  ·     PARECOXIB SODIUM: ChEMBL=392.4 DB=370.4 Δ=22.0
+  ·     SAFINAMIDE MESYLATE: ChEMBL=398.5 DB=302.3 Δ=96.1
+  ·     FOSPHENYTOIN SODIUM: ChEMBL=406.2 DB=362.3 Δ=44.0
+  ✓ MW conflicts are mostly benign salt-form differences
+  ✓ field_sources JSON valid on all populated rows
+
+Section 8 — NOSA candidate spot-check [WARN]
+  · --- BRIVARACETAM ---
+  ·   molecular_weight=212.29 | logP=0.9 | PSA=63.4 | H_donors=1.0 | pka_predicted=nan | logD_pH6=nan | max_dose_mg=200.0 | dose_feasible_nosa=nan | original_applicant_normalized=Ucb | earliest_patent_expiry=2026-02-21 | cns_target=True | composite_score=48.291333333333334
+  · --- DIMETHYL FUMARATE ---
+  ·   molecular_weight=144.13 | logP=-0.11 | PSA=52.6 | H_donors=0.0 | pka_predicted=nan | logD_pH6=nan | max_dose_mg=240.0 | dose_feasible_nosa=nan | original_applicant_normalized=Biogen | earliest_patent_expiry=2028-02-07 | cns_target=True | composite_score=70.33966666666666
+  · --- MELATONIN ---
+  ·   molecular_weight=232.28 | logP=1.86 | PSA=54.12 | H_donors=2.0 | pka_predicted=nan | logD_pH6=nan | max_dose_mg=10.0 | dose_feasible_nosa=nan | original_applicant_normalized=nan | earliest_patent_expiry=nan | cns_target=True | composite_score=71.60216666666666
+  · --- MEMANTINE ---
+  ·   molecular_weight=179.31 | logP=2.69 | PSA=26.02 | H_donors=1.0 | pka_predicted=9.5 | logD_pH6=-0.8101373142636583 | max_dose_mg=60.0 | dose_feasible_nosa=nan | original_applicant_normalized=AbbVie | earliest_patent_expiry=2029-03-24 | cns_target=True | composite_score=87.67479315906844
+  · --- MORPHINE ---
+  ·   molecular_weight=285.34 | logP=1.2 | PSA=52.93 | H_donors=2.0 | pka_predicted=10.0 | logD_pH6=1.1999565727231374 | max_dose_mg=4.0 | dose_feasible_nosa=nan | original_applicant_normalized=Hikma | earliest_patent_expiry=2027-06-19 | cns_target=True | composite_score=87.05519466457785
+  · --- NICOTINE ---
+  ·   molecular_weight=162.24 | logP=1.85 | PSA=16.13 | H_donors=0.0 | pka_predicted=4.5 | logD_pH6=1.836479077891962 | max_dose_mg=21.0 | dose_feasible_nosa=nan | original_applicant_normalized=Pfizer | earliest_patent_expiry=nan | cns_target=True | composite_score=99.04418993396098
+  · --- PROPRANOLOL ---
+  ·   molecular_weight=259.35 | logP=2.58 | PSA=41.49 | H_donors=2.0 | pka_predicted=9.5 | logD_pH6=-0.9201373142636582 | max_dose_mg=0.55 | dose_feasible_nosa=True | original_applicant_normalized=Wyeth | earliest_patent_expiry=2028-10-16 | cns_target=True | composite_score=86.89267777445306
+  · --- VALPROIC ACID ---
+  ·   molecular_weight=144.21 | logP=2.29 | PSA=37.3 | H_donors=1.0 | pka_predicted=4.2 | logD_pH6=0.4831708716875471 | max_dose_mg=1000.0 | dose_feasible_nosa=nan | original_applicant_normalized=Par | earliest_patent_expiry=nan | cns_target=True | composite_score=71.18906666243171
+  · --- VORTIOXETINE ---
+  ·   molecular_weight=298.46 | logP=3.86 | PSA=15.27 | H_donors=1.0 | pka_predicted=9.5 | logD_pH6=0.3598626857363416 | max_dose_mg=20.0 | dose_feasible_nosa=nan | original_applicant_normalized=Takeda | earliest_patent_expiry=2026-06-17 | cns_target=True | composite_score=76.5814598257351
+  · --- ZOLMITRIPTAN ---
+  ·   molecular_weight=287.36 | logP=1.92 | PSA=57.36 | H_donors=2.0 | pka_predicted=nan | logD_pH6=nan | max_dose_mg=5.0 | dose_feasible_nosa=nan | original_applicant_normalized=Ipr | earliest_patent_expiry=nan | cns_target=True | composite_score=57.36216666666667
+  ⚠ 1 candidate issues
+      melatonin: missing patent owner
+
+Section 9 — Coverage summary table and recommendations [PASS]
+  · Column                              Count   Coverage  Verdict
+  · ----------------------------------------------------------------------
+  · chembl_id                          10,534      99.9%  good
+  · drugbank_id                         4,729      44.8%  partial
+  · SMILES                             10,249      97.2%  good
+  · pubchem_cid                        10,391      98.5%  good
+  · vapor_pressure_mmhg                   382       3.6%  sparse
+  · melting_point_c                     1,707      16.2%  sparse
+  · boiling_point_c                       473       4.5%  sparse
+  · pka_predicted                       7,927      75.2%  partial
+  · logD_pH6                            7,748      73.5%  partial
+  · max_dose_mg                         2,981      28.3%  partial
+  · ct_max_dose_mg                      2,978      28.2%  partial
+  · mechanism_of_action                 4,083      38.7%  partial
+  · atc_code                            2,653      25.2%  partial
+  · mesh_heading                        5,310      50.4%  partial
+  · target_names                        1,089      10.3%  sparse
+  · cns_target                          4,729      44.8%  partial
+  · earliest_patent_expiry                831       7.9%  sparse
+  · original_applicant_normalized       1,874      17.8%  sparse
+  · big_pharma_owned                    1,874      17.8%  sparse
+  · field_sources                      10,545     100.0%  good
+  · 
+  · Prioritized recommendations:
+  ·   1. [10,163 rows] PubChem VP enrichment: vapor pressure only 3.6% — rerun enrich_pubchem.py
+  ·   2. [8,671 rows] Orange Book name matching: ~8,671 rows may need better ingredient join
+  ·   3. [7,564 rows] Dose enrichment: ~7,564 rows still lack unified max_dose_mg
+  ·   4. [5,617 rows] InChIKey re-match: recover DrugBank for ~5,617 SMILES rows missing name join
+  ·   5. [500 rows] Salt-form deduplication: 50+ prefix-related name_key pairs suggest over-splitting
+
+================================================================================

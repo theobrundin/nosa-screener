@@ -20,6 +20,27 @@ from rdkit import Chem
 from tqdm import tqdm
 
 from enrich_pubchem import PUG_BASE, REQUEST_SLEEP_S, request_json
+from pipeline_structure import (
+    build_drugbank_index,
+    count_smiles_no_drugbank,
+    deduplicate_with_structure,
+    fill_smiles_from_drugcentral_tiered,
+    finalize_structure_caches,
+    lookup_drugbank_payload,
+    merge_orange_book_extended,
+    prepare_structure_caches,
+    print_match_gain_table,
+    seed_pubchem_cache_from_drugcentral,
+    seed_pubchem_cache_from_dataframe,
+)
+from structure_match import (
+    add_structure_columns,
+    count_non_null_cells,
+    load_inchikey_cache,
+    recompute_dose_feasible_nosa,
+    sanitize_dose_columns,
+    sync_unified_dose,
+)
 
 ROOT = Path(__file__).resolve().parent
 ORANGE_BOOK_DIR = ROOT / "EOBZIP_2026_04"
@@ -612,9 +633,6 @@ def enrich_chembl_metadata(df: pd.DataFrame) -> pd.DataFrame:
         else None,
         axis=1,
     )
-    df["dose_feasible_nosa"] = df["max_clinical_dose_mg"].map(
-        lambda dose: True if pd.notna(dose) and dose <= 100 else False if pd.notna(dose) else None
-    )
 
     print(f"  Molecules with mechanism data: {len(mech_by_mol):,}")
     return df
@@ -774,9 +792,18 @@ def annotate_regulatory_flags(df: pd.DataFrame, approved_keys: set[str]) -> pd.D
 def load_drugcentral_structures() -> pd.DataFrame:
     structures = pd.read_csv(STRUCTURES_TSV, sep="\t")
     print("structures.smiles.tsv columns:", structures.columns.tolist())
-    structures = structures.rename(columns={"INN": "inn", "SMILES": "smiles"})
+    structures = structures.rename(columns={"INN": "inn", "SMILES": "smiles", "InChIKey": "inchikey"})
     structures["name_key"] = structures["inn"].map(normalize_name)
-    return structures[["name_key", "smiles"]].drop_duplicates(subset="name_key", keep="first")
+    inchi_cache = load_inchikey_cache()
+    structures = add_structure_columns(
+        structures,
+        smiles_col="smiles",
+        inchikey_col="inchikey",
+        cache=inchi_cache,
+    )
+    return structures[["name_key", "inn", "smiles", "inchikey", "inchikey_skeleton"]].drop_duplicates(
+        subset="name_key", keep="first"
+    )
 
 
 def fill_smiles_from_drugcentral(df: pd.DataFrame, structures: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -886,14 +913,16 @@ def build_manual_compounds(chembl_keys: set[str]) -> tuple[pd.DataFrame, list[st
 
 
 def deduplicate(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    before = len(df)
-    df = df.copy()
-    df["_priority"] = df["source"].map({"chembl": 0, "manual": 1}).fillna(2)
-    df["_phase_sort"] = pd.to_numeric(df["chembl_max_phase"], errors="coerce").fillna(-1)
-    df = df.sort_values(["_priority", "_phase_sort"], ascending=[True, False])
-    df = df.drop_duplicates(subset="name_key", keep="first")
-    df = df.drop(columns=["_priority", "_phase_sort"])
-    return df, before - len(df)
+    df, removed, merges, relations = deduplicate_with_structure(df, normalize_name)
+    if merges:
+        print("  InChIKey duplicate merges:")
+        for line in merges[:10]:
+            print(f"    · {line}")
+    if relations:
+        print("  Skeleton-related forms linked:")
+        for line in relations[:10]:
+            print(f"    · {line}")
+    return df, removed
 
 
 def carry_forward_enrichment(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -1257,9 +1286,12 @@ def extract_drugbank_annotations(
         result.get("target_genes"),
         result.get("primary_target"),
         db_row.get("mechanism-of-action"),
-        db_row.get("pharmacodynamics"),
     ]
-    result["cns_target"] = is_cns_associated(*cns_text)
+    has_target_data = bool(
+        result.get("target_names") or result.get("primary_target") or result.get("target_count")
+    )
+    has_mechanism = bool(_clean_db_value(db_row.get("mechanism-of-action")))
+    result["cns_target"] = (has_target_data or has_mechanism) and is_cns_associated(*cns_text)
 
     cyp_text = [result.get("metabolizing_enzymes"), result.get("cyp_enzymes"), metabolism]
     result["nasal_cyp_risk"] = has_nasal_cyp_risk(*cyp_text)
@@ -1273,7 +1305,7 @@ def extract_drugbank_annotations(
 
 def merge_drugbank_annotations(
     df: pd.DataFrame,
-    drugbank: pd.DataFrame,
+    db_index,
     proteins: pd.DataFrame,
     lookup: dict[str, dict[str, str]],
 ) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -1289,18 +1321,19 @@ def merge_drugbank_annotations(
     for col in ANNOTATION_COLUMNS:
         if col not in df.columns:
             df[col] = None
+    if "drugbank_match_method" not in df.columns:
+        df["drugbank_match_method"] = None
 
-    if drugbank.empty:
+    if db_index is None:
         return df, stats
 
-    db_by_key = drugbank.set_index("name_key", drop=False)
-
     for idx, row in df.iterrows():
-        if row["name_key"] not in db_by_key.index:
+        db_row_dict, method = lookup_drugbank_payload(db_index, row)
+        if db_row_dict is None:
             continue
-        db_row = db_by_key.loc[row["name_key"]]
-        if isinstance(db_row, pd.DataFrame):
-            db_row = db_row.iloc[0]
+        if not row.get("drugbank_match_method") and method:
+            df.at[idx, "drugbank_match_method"] = method
+        db_row = pd.Series(db_row_dict)
         ann = extract_drugbank_annotations(db_row, proteins, lookup)
         for col, val in ann.items():
             df.at[idx, col] = val
@@ -1359,7 +1392,7 @@ def load_drugbank() -> pd.DataFrame:
     return db
 
 
-def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+def merge_drugbank_priorities(df: pd.DataFrame, db_index) -> tuple[pd.DataFrame, dict[str, int]]:
     """Apply field-level DrugBank vs ChEMBL source priority with conflict tracking."""
     stats = {
         "mechanism_drugbank_primary": 0,
@@ -1370,6 +1403,11 @@ def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple
         "physical_state_populated": 0,
         "pk_populated": 0,
         "drugbank_matches": 0,
+        "drugbank_inchikey": 0,
+        "drugbank_skeleton": 0,
+        "drugbank_name": 0,
+        "drugbank_small_molecule": 0,
+        "drugbank_biologic": 0,
     }
 
     df = df.copy()
@@ -1384,15 +1422,14 @@ def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple
         "mw_conflict",
         "field_sources",
         "drugbank_id",
+        "drugbank_match_method",
     ]:
         if col not in df.columns:
             df[col] = None
 
-    if drugbank.empty:
+    if db_index is None:
         df["field_sources"] = df.apply(lambda _: json.dumps({}), axis=1)
         return df, stats
-
-    db_by_key = drugbank.set_index("name_key", drop=False)
 
     def merge_row(row: pd.Series) -> pd.Series:
         sources: dict[str, str] = {}
@@ -1407,14 +1444,22 @@ def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple
             elif pd.notna(row.get(field)) and str(row.get(field)).strip() != "":
                 sources[field] = "chembl"
 
-        if row["name_key"] not in db_by_key.index:
+        db_row_dict, method = lookup_drugbank_payload(db_index, row)
+        if db_row_dict is None:
             row["field_sources"] = json.dumps(sources, sort_keys=True)
             return row
 
         stats["drugbank_matches"] += 1
-        db_row = db_by_key.loc[row["name_key"]]
-        if isinstance(db_row, pd.DataFrame):
-            db_row = db_row.iloc[0]
+        if method:
+            stats[f"drugbank_{method}"] = stats.get(f"drugbank_{method}", 0) + 1
+            row["drugbank_match_method"] = method
+
+        db_row = pd.Series(db_row_dict)
+        db_type = str(db_row.get("type", "")).lower()
+        if db_type == "small molecule":
+            stats["drugbank_small_molecule"] += 1
+        elif db_type == "biotech":
+            stats["drugbank_biologic"] += 1
 
         row["drugbank_id"] = _clean_db_value(db_row.get("drugbank-id"))
         row["sources"] = add_source(row.get("sources"), "drugbank")
@@ -1473,7 +1518,6 @@ def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple
         row["field_sources"] = json.dumps(sources, sort_keys=True)
         return row
 
-    # Use explicit loop so stats mutate correctly (apply with closure is awkward for counters)
     rows_out: list[pd.Series] = []
     for _, row in tqdm(df.iterrows(), total=len(df), desc="Merging DrugBank priorities"):
         rows_out.append(merge_row(row.copy()))
@@ -1482,7 +1526,12 @@ def merge_drugbank_priorities(df: pd.DataFrame, drugbank: pd.DataFrame) -> tuple
 
 def print_drugbank_summary(stats: dict[str, int]) -> None:
     print("\n── Source priority & conflicts ───────────────────")
-    print(f"  DrugBank name matches:           {stats.get('drugbank_matches', 0):>7,}")
+    print(f"  DrugBank matches (all tiers):    {stats.get('drugbank_matches', 0):>7,}")
+    print(f"    via InChIKey:                  {stats.get('drugbank_inchikey', 0):>7,}")
+    print(f"    via skeleton:                  {stats.get('drugbank_skeleton', 0):>7,}")
+    print(f"    via name:                      {stats.get('drugbank_name', 0):>7,}")
+    print(f"    small molecule:                {stats.get('drugbank_small_molecule', 0):>7,}")
+    print(f"    biologic:                      {stats.get('drugbank_biologic', 0):>7,}")
     print(f"  Mechanism: DrugBank primary     {stats.get('mechanism_drugbank_primary', 0):>7,}")
     print(f"  Mechanism: ChEMBL fallback used  {stats.get('mechanism_chembl_fallback', 0):>7,}")
     print(f"  Mechanism conflicts flagged      {stats.get('mechanism_conflicts', 0):>7,}")
@@ -1529,6 +1578,14 @@ def print_build_summary(stats: dict[str, int]) -> None:
     print(f"  Output → {OUTPUT_CSV.name}")
     print("  Next step: python enrich_pubchem.py to fill")
     print(f"             VP/MP for ~{new_rows:,} new rows")
+
+
+def finalize_dose_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Sync unified max_dose_mg and recompute dose_feasible_nosa after all merges."""
+    df = sanitize_dose_columns(df)
+    if "max_clinical_dose_mg" in df.columns or "ct_max_dose_mg" in df.columns:
+        df = df.apply(sync_unified_dose, axis=1)
+    return recompute_dose_feasible_nosa(df)
 
 
 def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -1583,6 +1640,9 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
             print(f"    - {name}")
 
     combined = pd.concat([chembl, manual_df], ignore_index=True, sort=False)
+    inchi_cache, pubchem_cache = prepare_structure_caches()
+    combined = add_structure_columns(combined, cache=inchi_cache)
+    seed_pubchem_cache_from_dataframe(combined, pubchem_cache)
     combined, stats["duplicates_removed"] = deduplicate(combined)
 
     phase_numeric = pd.to_numeric(combined["chembl_max_phase"], errors="coerce")
@@ -1590,9 +1650,36 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     stats["phase_3"] = int((phase_numeric == 3).sum())
     stats["phase_2"] = int((phase_numeric == 2).sum())
 
+    total_rows = len(combined)
+    baseline_non_null = count_non_null_cells(combined)
+    baseline_drugbank = 0.0
+    baseline_ob = 0.0
+    if ENRICHED_CSV.exists():
+        old = pd.read_csv(ENRICHED_CSV, low_memory=False, nrows=0)
+        _ = old  # presence check only
+        old_full = pd.read_csv(ENRICHED_CSV, low_memory=False)
+        baseline_drugbank = 100.0 * old_full["drugbank_id"].notna().sum() / len(old_full) if "drugbank_id" in old_full.columns else 44.8
+        if "original_applicant_normalized" in old_full.columns:
+            baseline_ob = 100.0 * old_full["original_applicant_normalized"].notna().sum() / len(old_full)
+        else:
+            baseline_ob = 17.8
+    else:
+        baseline_drugbank = 44.8
+        baseline_ob = 17.8
+
     print("Loading and merging Orange Book files...")
     orange_book = load_orange_book()
-    merged = combined.merge(orange_book, on="name_key", how="left")
+    structures = load_drugcentral_structures()
+    seed_pubchem_cache_from_drugcentral(structures, pubchem_cache)
+
+    merged, ob_tiers = merge_orange_book_extended(
+        combined,
+        orange_book,
+        pubchem_cache,
+        inchi_cache,
+        allow_pubchem_api=False,
+    )
+    print(f"  Orange Book tiers: name={ob_tiers.get('name', 0):,}, skeleton={ob_tiers.get('skeleton', 0):,}")
 
     approved_keys, _ = load_regulatory_annotations()
     merged = annotate_regulatory_flags(merged, approved_keys)
@@ -1601,17 +1688,22 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     print(f"  EMA approved flags set: {stats['ema_flags']:,}")
     print(f"  PMDA approved flags set: {stats['pmda_flags']:,}")
 
-    structures = load_drugcentral_structures()
     merged["smiles_source"] = None
     merged.loc[merged["SMILES"].notna(), "smiles_source"] = "chembl"
-    merged, stats["smiles_filled"] = fill_smiles_from_drugcentral(merged, structures)
-    print(f"  SMILES filled from DrugCentral: {stats['smiles_filled']:,}")
+    merged, stats["smiles_filled"], dc_tiers = fill_smiles_from_drugcentral_tiered(merged, structures)
+    print(f"  SMILES filled from DrugCentral: {stats['smiles_filled']:,} ({dc_tiers})")
+    merged = add_structure_columns(merged, cache=inchi_cache)
 
     drugbank = load_drugbank()
+    db_index = None
+    if not drugbank.empty:
+        db_index, _drugbank_enriched = build_drugbank_index(
+            drugbank, structures, pubchem_cache, inchi_cache
+        )
     proteins = load_drugbank_proteins()
     uniprot_lookup = load_uniprot_lookup()
-    merged, drugbank_stats = merge_drugbank_priorities(merged, drugbank)
-    merged, annotation_stats = merge_drugbank_annotations(merged, drugbank, proteins, uniprot_lookup)
+    merged, drugbank_stats = merge_drugbank_priorities(merged, db_index)
+    merged, annotation_stats = merge_drugbank_annotations(merged, db_index, proteins, uniprot_lookup)
     stats.update(drugbank_stats)
     stats.update(annotation_stats)
 
@@ -1621,6 +1713,31 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     merged = flag_nosa_candidates(merged)
     merged, stats["enriched_carried"] = carry_forward_enrichment(merged)
     print(f"  Enriched rows carried forward: {stats['enriched_carried']:,}")
+
+    merged = finalize_dose_columns(merged)
+    finalize_structure_caches(inchi_cache, pubchem_cache)
+
+    after_non_null = count_non_null_cells(merged)
+    print("\n── Structure match gains (before → after) ────────")
+    print(f"  {'Source':<14} {'Name-only':>10} {'+InChIKey':>10} {'Net gain':>12}")
+    db_count = int(merged["drugbank_id"].notna().sum())
+    print_match_gain_table(
+        "DrugBank",
+        baseline_drugbank,
+        db_count,
+        total_rows,
+        {
+            "inchikey": stats.get("drugbank_inchikey", 0),
+            "skeleton": stats.get("drugbank_skeleton", 0),
+            "name": stats.get("drugbank_name", 0),
+        },
+    )
+    ob_count = int(merged["original_applicant_normalized"].notna().sum()) if "original_applicant_normalized" in merged.columns else 0
+    print_match_gain_table("Orange Book", baseline_ob, ob_count, total_rows, ob_tiers)
+    dc_count = int(merged["SMILES"].notna().sum())
+    print_match_gain_table("DrugCentral", 0.0, stats["smiles_filled"], total_rows, dc_tiers)
+    print(f"  SMILES but no DrugBank: {count_smiles_no_drugbank(merged):,}")
+    print(f"  Total non-null cells: {baseline_non_null:,} → {after_non_null:,} (+{after_non_null - baseline_non_null:,})")
 
     column_order = [
         "name",
@@ -1677,8 +1794,14 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
         "toxicity",
         "SMILES",
         "smiles_source",
+        "inchikey",
+        "inchikey_skeleton",
+        "related_forms",
         "source",
         "sources",
+        "drugbank_match_method",
+        "drugcentral_match_method",
+        "orange_book_match_method",
         "ingredient",
         "earliest_patent_expiry",
         "earliest_exclusivity_date",
@@ -1722,26 +1845,31 @@ def build_database(skip_chembl: bool = False) -> tuple[pd.DataFrame, dict[str, i
     return merged, stats
 
 
-def sync_patent_columns_to_enriched(master: pd.DataFrame) -> None:
-    """Merge patent-owner columns into enriched CSV when it exists."""
+def sync_master_to_enriched(master: pd.DataFrame) -> None:
+    """Merge pipeline columns from master into enriched CSV, preserving PubChem/CT enrichment."""
     if not ENRICHED_CSV.exists():
         return
-    cols = [c for c in PATENT_OWNER_COLUMNS if c in master.columns]
-    if not cols:
-        return
     enriched = pd.read_csv(ENRICHED_CSV, low_memory=False)
-    update = master[["name", *cols]].drop_duplicates(subset="name", keep="first")
-    enriched = enriched.drop(columns=[c for c in cols if c in enriched.columns], errors="ignore")
+    ct_cols = [c for c in enriched.columns if c.startswith("ct_")]
+    preserve = set(ENRICHMENT_COLUMNS) | set(ct_cols) | {"max_dose_source"}
+
+    sync_cols = [c for c in master.columns if c not in preserve and c != "name"]
+    if not sync_cols:
+        return
+
+    update = master[["name", *sync_cols]].drop_duplicates(subset="name", keep="first")
+    enriched = enriched.drop(columns=[c for c in sync_cols if c in enriched.columns], errors="ignore")
     enriched = enriched.merge(update, on="name", how="left")
+    enriched = finalize_dose_columns(enriched)
     enriched.to_csv(ENRICHED_CSV, index=False)
-    print(f"  Patent-owner columns synced → {ENRICHED_CSV.name}")
+    print(f"  Master pipeline columns synced → {ENRICHED_CSV.name} ({len(sync_cols)} cols)")
 
 
 def main() -> None:
     args = parse_args()
     df, stats = build_database(skip_chembl=args.skip_chembl)
     df.to_csv(OUTPUT_CSV, index=False)
-    sync_patent_columns_to_enriched(df)
+    sync_master_to_enriched(df)
     print_build_summary(stats)
     print_drugbank_summary(stats)
 
