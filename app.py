@@ -25,6 +25,15 @@ TEXT = "#FFFFFF"
 SURFACE = "#174F4F"
 DISABLED = "#3A6B6B"
 MEMANTINE_COLOR = "#FFD700"
+MANUAL_PASS_COLOR = "#2ECC71"
+MANUAL_FAIL_COLOR = "#C0392B"
+
+MANUAL_SCORE_FILTER_OPTIONS = (
+    "All",
+    "Pass only (1)",
+    "No pass (0)",
+    "Not yet evaluated (blank)",
+)
 
 BASE_IDEAL = {
     "molecular_weight": 179.31,
@@ -287,6 +296,12 @@ def load_database(path_str: str) -> pd.DataFrame:
         df["pgp_substrate"] = df["pgp_substrate"].astype("boolean").fillna(False).astype(bool)
     if "big_pharma_owned" in df.columns:
         df["big_pharma_owned"] = df["big_pharma_owned"].astype("boolean").fillna(False).astype(bool)
+    if "manual_score" in df.columns:
+        df["manual_score"] = pd.to_numeric(df["manual_score"], errors="coerce").astype("Int64")
+    if "manual_score_comment" in df.columns:
+        df["manual_score_comment"] = df["manual_score_comment"].astype("string")
+    if "manual_eval_set" in df.columns:
+        df["manual_eval_set"] = df["manual_eval_set"].astype("boolean").fillna(False).astype(bool)
     if "route_of_administration" in df.columns:
         df["_route_tokens"] = df["route_of_administration"].map(
             lambda v: frozenset(_split_pipe_values(v))
@@ -562,6 +577,54 @@ def render_drugbank_filters(df: pd.DataFrame) -> tuple[bool, bool, bool]:
     return cns_only, hide_nasal_cyp, hide_pgp
 
 
+def apply_manual_score_filter(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    """Filter by manually curated evaluation. Blanks stay blank (never coerced to 0)."""
+    if mode == "All" or "manual_score" not in df.columns:
+        return df
+    score = df["manual_score"]
+    if mode == "Pass only (1)":
+        return df.loc[score == 1]
+    if mode == "No pass (0)":
+        return df.loc[score == 0]
+    if mode == "Not yet evaluated (blank)":
+        # Prefer the curated evaluation batch when present; otherwise all NaN scores.
+        if "manual_eval_set" in df.columns:
+            in_set = df["manual_eval_set"].fillna(False).astype(bool)
+            return df.loc[in_set & score.isna()]
+        return df.loc[score.isna()]
+    return df
+
+
+def render_manual_score_filter(df: pd.DataFrame) -> str:
+    st.subheader("Manual evaluation")
+    if "manual_score" not in df.columns:
+        st.caption("Run `python merge_manual_scores.py` to enable this filter.")
+        return "All"
+
+    score = df["manual_score"]
+    n_pass = int((score == 1).sum())
+    n_fail = int((score == 0).sum())
+    if "manual_eval_set" in df.columns:
+        n_blank = int((df["manual_eval_set"].fillna(False) & score.isna()).sum())
+        n_eval = n_pass + n_fail
+        n_set = int(df["manual_eval_set"].fillna(False).sum())
+        st.caption(
+            f"Eval set {n_set:,} · Evaluated {n_eval:,} · Pass {n_pass:,} · "
+            f"No pass {n_fail:,} · Pending {n_blank:,}"
+        )
+    else:
+        n_blank = int(score.isna().sum())
+        n_eval = n_pass + n_fail
+        st.caption(f"Evaluated {n_eval:,} · Pass {n_pass:,} · No pass {n_fail:,} · Pending {n_blank:,}")
+    return st.radio(
+        "Manual evaluation",
+        options=list(MANUAL_SCORE_FILTER_OPTIONS),
+        index=0,
+        key="filter_manual_score",
+        label_visibility="collapsed",
+    )
+
+
 def apply_drugbank_filters(
     df: pd.DataFrame,
     cns_only: bool,
@@ -637,9 +700,11 @@ def prepare_results_table(df: pd.DataFrame, limit: int = DISPLAY_ROW_LIMIT) -> t
     """Build display-ready string table (capped for performance)."""
     display_cols = [
         "name",
+        "manual_score",
         "chembl_id",
         "chembl_max_phase",
         "composite_score",
+        "manual_score_comment",
         "cns_target",
         "primary_target",
         "nasal_cyp_risk",
@@ -739,6 +804,18 @@ def prepare_results_table(df: pd.DataFrame, limit: int = DISPLAY_ROW_LIMIT) -> t
             continue
         if col == "composite_score":
             values = work[col].round(1).astype(str)
+        elif col == "manual_score":
+            values = work[col].map(
+                lambda v: "1" if pd.notna(v) and int(v) == 1
+                else "0" if pd.notna(v) and int(v) == 0
+                else ""
+            )
+        elif col == "manual_score_comment":
+            values = work[col].map(
+                lambda v: ""
+                if pd.isna(v) or str(v).strip() == ""
+                else (str(v)[:77] + "…") if len(str(v)) > 80 else str(v)
+            )
         elif col == "chembl_max_phase":
             values = work[col].apply(lambda v: str(int(v)) if pd.notna(v) else "—")
         elif col == "dose_feasible_nosa":
@@ -783,21 +860,31 @@ def style_results_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             return [f"background-color: {ACCENT}; color: {PRIMARY}; font-weight: 600"] * len(row)
         return [f"background-color: {SURFACE}; color: {TEXT}"] * len(row)
 
-    def dose_badge_style(row: pd.Series) -> list[str]:
+    def badge_style(row: pd.Series) -> list[str]:
         base = highlight_nosa(row)
-        if "dose_feasible_nosa" not in row.index:
-            return base
-        badge = row["dose_feasible_nosa"]
-        dose_idx = list(row.index).index("dose_feasible_nosa")
-        if badge == "✓":
-            base[dose_idx] = f"background-color: #2E8B57; color: {TEXT}; font-weight: 700"
-        elif badge == "✗":
-            base[dose_idx] = f"background-color: #C0392B; color: {TEXT}; font-weight: 700"
-        elif badge == "?":
-            base[dose_idx] = f"background-color: {DISABLED}; color: {TEXT}; font-weight: 700"
+        if "dose_feasible_nosa" in row.index:
+            badge = row["dose_feasible_nosa"]
+            dose_idx = list(row.index).index("dose_feasible_nosa")
+            if badge == "✓":
+                base[dose_idx] = f"background-color: #2E8B57; color: {TEXT}; font-weight: 700"
+            elif badge == "✗":
+                base[dose_idx] = f"background-color: #C0392B; color: {TEXT}; font-weight: 700"
+            elif badge == "?":
+                base[dose_idx] = f"background-color: {DISABLED}; color: {TEXT}; font-weight: 700"
+        if "manual_score" in row.index:
+            score = row["manual_score"]
+            score_idx = list(row.index).index("manual_score")
+            if score == "1":
+                base[score_idx] = (
+                    f"background-color: {MANUAL_PASS_COLOR}; color: {PRIMARY}; font-weight: 700"
+                )
+            elif score == "0":
+                base[score_idx] = (
+                    f"background-color: {MANUAL_FAIL_COLOR}; color: {TEXT}; font-weight: 700"
+                )
         return base
 
-    return shown.style.apply(dose_badge_style, axis=1)
+    return shown.style.apply(badge_style, axis=1)
 
 
 def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
@@ -816,6 +903,19 @@ def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
             st.markdown(f"DrugBank ID: `{row['drugbank_id']}`")
         if row.get("chembl_id"):
             st.markdown(f"ChEMBL ID: `{row['chembl_id']}`")
+
+        if "manual_score" in row.index:
+            score = row.get("manual_score")
+            if pd.isna(score):
+                score_label = "Not yet evaluated"
+            elif int(score) == 1:
+                score_label = "Pass (1)"
+            else:
+                score_label = "No pass (0)"
+            st.markdown(f"**Manual evaluation:** {score_label}")
+            comment = row.get("manual_score_comment")
+            if pd.notna(comment) and str(comment).strip():
+                st.markdown(f"**Score comment:** {comment}")
 
         st.markdown("**Data sources**")
         if sources:
@@ -926,15 +1026,24 @@ def render_drug_detail_panel(filtered: pd.DataFrame) -> None:
 
 def build_scatter(df: pd.DataFrame, ideal: dict[str, float]) -> go.Figure:
     plot_df = df.dropna(subset=["logP", "molecular_weight"]).copy()
-    plot_df["series"] = plot_df["nosa_candidate"].map(
-        {True: "NOSA candidate", False: "Other"}
-    )
+    if "manual_score" in plot_df.columns:
+        plot_df["series"] = plot_df.apply(
+            lambda row: "Manual pass (1)"
+            if pd.notna(row.get("manual_score")) and int(row["manual_score"]) == 1
+            else ("NOSA candidate" if bool(row.get("nosa_candidate")) else "Other"),
+            axis=1,
+        )
+    else:
+        plot_df["series"] = plot_df["nosa_candidate"].map(
+            {True: "NOSA candidate", False: "Other"}
+        )
 
     fig = px.scatter(
         plot_df,
         x="molecular_weight",
         y="logP",
         color="series",
+        symbol="series",
         hover_name="name",
         hover_data={
             "composite_score": ":.1f",
@@ -944,10 +1053,15 @@ def build_scatter(df: pd.DataFrame, ideal: dict[str, float]) -> go.Figure:
             "series": False,
         },
         color_discrete_map={
+            "Manual pass (1)": MANUAL_PASS_COLOR,
             "NOSA candidate": ACCENT,
             "Other": "rgba(255,255,255,0.45)",
         },
-        symbol_map={"NOSA candidate": "star", "Other": "circle"},
+        symbol_map={
+            "Manual pass (1)": "triangle-up",
+            "NOSA candidate": "star",
+            "Other": "circle",
+        },
         labels={
             "molecular_weight": "Molecular weight (Da)",
             "logP": "logP",
@@ -1375,6 +1489,9 @@ def main() -> None:
         selected_applicants, big_pharma_only = render_applicant_filters(df)
 
         st.divider()
+        manual_score_mode = render_manual_score_filter(df)
+
+        st.divider()
         cns_only, hide_nasal_cyp, hide_pgp = render_drugbank_filters(df)
 
         st.divider()
@@ -1389,6 +1506,7 @@ def main() -> None:
             preview, hide_phases, hide_with_patent, hide_without_patent
         )
         preview = apply_applicant_filters(preview, selected_applicants, big_pharma_only)
+        preview = apply_manual_score_filter(preview, manual_score_mode)
         preview = apply_drugbank_filters(preview, cns_only, hide_nasal_cyp, hide_pgp)
         preview_nosa = int(preview["nosa_candidate"].fillna(False).sum()) if len(preview) else 0
         st.caption(
@@ -1404,6 +1522,7 @@ def main() -> None:
         filtered, hide_phases, hide_with_patent, hide_without_patent
     )
     filtered = apply_applicant_filters(filtered, selected_applicants, big_pharma_only)
+    filtered = apply_manual_score_filter(filtered, manual_score_mode)
     filtered = apply_drugbank_filters(filtered, cns_only, hide_nasal_cyp, hide_pgp)
     filtered["composite_score"] = composite_score(filtered, ideal, slider_ranges)
     filtered = filtered.sort_values("composite_score", ascending=False)
@@ -1411,10 +1530,31 @@ def main() -> None:
     passing = len(filtered)
     nosa_in_view = int(filtered["nosa_candidate"].fillna(False).sum())
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Drugs passing filters", f"{passing:,}")
-    m2.metric("Total in database", f"{total_drugs:,}")
-    m3.metric("NOSA candidates in view", nosa_in_view)
+    if "manual_score" in df.columns:
+        eval_count = int(df["manual_score"].notna().sum())
+        pass_count = int((df["manual_score"] == 1).sum())
+        if "manual_eval_set" in df.columns:
+            pending_count = int(
+                (df["manual_eval_set"].fillna(False) & df["manual_score"].isna()).sum()
+            )
+        else:
+            pending_count = int(df["manual_score"].isna().sum())
+    else:
+        eval_count = pass_count = pending_count = 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total in database", f"{total_drugs:,}")
+    m2.metric("Evaluated", f"{eval_count:,}")
+    m3.metric("Pass (1)", f"{pass_count:,}")
+    m4.metric("Pending", f"{pending_count:,}")
+
+    f1, f2, f3 = st.columns(3)
+    f1.metric("Drugs passing filters", f"{passing:,}")
+    f2.metric("NOSA candidates in view", nosa_in_view)
+    f3.metric(
+        "Manual pass in view",
+        int((filtered["manual_score"] == 1).sum()) if "manual_score" in filtered.columns else 0,
+    )
 
     col_table, col_chart = st.columns([1.2, 1])
 
@@ -1432,6 +1572,18 @@ def main() -> None:
                 style_results_table(filtered),
                 width="stretch",
                 height=480,
+                column_config={
+                    "manual_score": st.column_config.TextColumn(
+                        "Score",
+                        help="1 = pass · 0 = no pass · blank = not yet evaluated",
+                        width="small",
+                    ),
+                    "manual_score_comment": st.column_config.TextColumn(
+                        "Score comment",
+                        help="Full comment is in Drug detail below",
+                        width="large",
+                    ),
+                },
             )
         render_drug_detail_panel(filtered)
 
