@@ -97,22 +97,22 @@ FILTER_STEPS = {
 }
 
 CLINICAL_DEFAULTS = {
-    "pka_predicted": (3.0, 11.0),
-    "logD_pH6": (-2.0, 5.0),
+    "pka_predicted": (3.0, 10.0),
+    "logD_pH6": (-1.0, 5.0),
     "max_dose_mg": (0.0, 100.0),
 }
 
 NOSA_OPTIMAL_PRESET: dict[str, tuple[float, float] | None] = {
-    "molecular_weight": (100, 400),
-    "logP": (0.5, 5.0),
+    "molecular_weight": (100, 300),
+    "logP": (1.0, 4.0),
     "PSA": (0, 100),
     "H_donors": (0, 3),
     "rotatable_bonds": (0, 7),
-    "pka_predicted": (3, 11),
-    "logD_pH6": (-2, 5),
-    "melting_point_c": (0, 320),
+    "pka_predicted": (3, 10),
+    "logD_pH6": (-1, 5),
+    "melting_point_c": (0, 300),
     "max_dose_mg": (0, 100),
-    "vapor_pressure_mmhg": None,  # leave fully open — data too sparse to filter
+    "vapor_pressure_mmhg": (0, 100),
 }
 
 ATC_LEVEL1_NAMES = {
